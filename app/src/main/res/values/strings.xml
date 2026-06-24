@@ -1,0 +1,6 @@
+<resources>
+    <string name="app_name">FluentCity AI</string>
+    <string name="landing_headline">Practise the English you actually need where you live.</string>
+    <string name="landing_description">AI-powered English practice for daily life, work, study, and local situations.</string>
+    <string name="start_button">Start English Check</string>
+</resources>

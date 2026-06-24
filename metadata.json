@@ -1,0 +1,6 @@
+{
+  "name": "FluentCity AI",
+  "description": "AI-powered English practice for daily life, work, study, and local situations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
