@@ -1,6 +1,19 @@
 package com.example
 
+import androidx.compose.runtime.DisposableEffect
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.ui.platform.LocalContext
 import android.os.Bundle
+import android.Manifest
+import android.content.Intent
+import android.speech.RecognitionListener
+import android.speech.RecognizerIntent
+import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import java.util.Locale
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -25,6 +38,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -53,7 +67,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Check
@@ -66,6 +82,8 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.filled.Settings
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -73,6 +91,8 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -146,10 +166,26 @@ import retrofit2.http.Query
 class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    FirebaseManager.initialize(applicationContext)
     enableEdgeToEdge()
     setContent {
-      MyApplicationTheme {
-        FluentCityApp()
+      val systemDark = isSystemInDarkTheme()
+      val localStorageManager = remember { LocalStorageManager(this@MainActivity) }
+      var isDarkTheme by remember { mutableStateOf(localStorageManager.load("theme_preference", systemDark)) }
+      
+      LaunchedEffect(isDarkTheme) {
+        localStorageManager.save("theme_preference", isDarkTheme)
+        val uid = FirebaseManager.getCurrentUserId()
+        if (uid != null) {
+          FirebaseManager.updateAppSettings(uid, mapOf("theme" to if (isDarkTheme) "dark" else "light"))
+        }
+      }
+      
+      MyApplicationTheme(darkTheme = isDarkTheme) {
+        FluentCityApp(
+          isDarkTheme = isDarkTheme,
+          onToggleTheme = { isDarkTheme = !isDarkTheme }
+        )
       }
     }
   }
@@ -158,6 +194,7 @@ class MainActivity : ComponentActivity() {
 // State enum for routing
 enum class Screen {
   Landing,
+  WelcomeBack,
   Onboarding,
   SpeakingCheck,
   CheckResult,
@@ -165,9 +202,12 @@ enum class Screen {
   LessonValidation,
   PracticeModeSelection,
   PracticeChat,
+  VoicePractice,
   Progress,
   Review,
-  Reassessment
+  Reassessment,
+  Settings,
+  CreateAccount
 }
 
 // Saved User State answers
@@ -176,9 +216,16 @@ data class UserOnboardingData(
   val skillsToImprove: String = "All", // Speaking, Listening, Reading, Writing, All
   val mainGoal: String = "Daily life", // Daily life, Work, Study, Job interview, Social confidence
   val practiceMinutes: Int = 20, // 10, 20, 30, 45, 60
-  val checkIntroduce: String = "",
-  val checkReason: String = "",
-  val checkLandlord: String = ""
+  val checkSpeaking: String = "",
+  val checkListening1: String = "",
+  val checkListening2: String = "",
+  val checkListening3: String = "",
+  val checkReading1: String = "",
+  val checkReading2: String = "",
+  val checkReading3: String = "",
+  val checkWriting1: String = "",
+  val checkWriting2: String = "",
+  val checkWriting3: String = ""
 )
 
 // Learning Profile System data model
@@ -298,6 +345,88 @@ fun determineCategoryFromCorrection(correction: String): String {
   }
 }
 
+fun saveSessionDataToFirestore(
+  uid: String?,
+  task: DayTask?,
+  city: String?,
+  score: Int,
+  confidence: String,
+  feedback: SessionFeedback?,
+  uniqueNewReviews: List<ReviewItem>,
+  completedDays: Int,
+  confidenceRatings: Map<Int, String>,
+  isVoice: Boolean
+) {
+  if (uid == null) return
+  val sessionId = "session_${System.currentTimeMillis()}"
+  val sessionData = mapOf(
+    "date" to System.currentTimeMillis(),
+    "skill" to if (isVoice) "Speaking" else "Writing",
+    "scenarioId" to task?.day?.toString(),
+    "city" to city,
+    "goal" to task?.title,
+    "score" to score,
+    "confidence" to confidence.toIntOrNull(),
+    "completed" to true,
+    "durationMinutes" to 15,
+    "aiFeedback" to feedback?.let { fb ->
+      mapOf(
+        "taskCompletion" to fb.taskCompletion.score,
+        "grammar" to fb.grammar.score,
+        "vocabulary" to fb.vocabulary.score,
+        "fluency" to fb.fluency.score,
+        "naturalness" to fb.naturalness.score
+      )
+    }
+  )
+  FirebaseManager.savePracticeSession(uid, sessionId, sessionData)
+
+  feedback?.let { fb ->
+    val mainCorrection = fb.grammar.correction
+    val mainNatural = fb.grammar.naturalVersion
+    if (mainCorrection.isNotBlank() && mainNatural.isNotBlank()) {
+      val mistakeId = "mistake_${System.currentTimeMillis()}"
+      val mistakeData = mapOf(
+        "mistakeType" to "Grammar",
+        "originalText" to mainCorrection,
+        "correctedText" to mainCorrection,
+        "naturalVersion" to mainNatural,
+        "explanation" to fb.grammar.explanation,
+        "skill" to if (isVoice) "Speaking" else "Writing",
+        "repeatedCount" to 1,
+        "lastSeenAt" to System.currentTimeMillis()
+      )
+      FirebaseManager.saveMistake(uid, mistakeId, mistakeData)
+    }
+  }
+
+  uniqueNewReviews.forEach { review ->
+    val reviewId = "review_${System.currentTimeMillis()}_${review.targetPhrase.hashCode()}"
+    val reviewData = mapOf(
+      "phraseOrMistake" to review.targetPhrase,
+      "skill" to if (isVoice) "Speaking" else "Writing",
+      "level" to 1,
+      "nextReviewDate" to System.currentTimeMillis() + 86400000, // +1 day
+      "reviewStage" to 0,
+      "mastered" to false,
+      "createdAt" to System.currentTimeMillis()
+    )
+    FirebaseManager.saveReviewItem(uid, reviewId, reviewData)
+  }
+
+  val dateString = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.US).format(java.util.Date())
+  val progressData = mapOf(
+    "date" to dateString,
+    "totalPracticeMinutes" to completedDays * 15,
+    "completedMissions" to completedDays,
+    "speakingScore" to if (isVoice) score else null,
+    "writingScore" to if (!isVoice) score else null,
+    "confidenceAverage" to confidenceRatings.values.mapNotNull { it.toIntOrNull() }.average().takeIf { !it.isNaN() },
+    "topWeakness" to feedback?.improvement?.mistakeType
+  )
+  FirebaseManager.saveProgressSnapshot(uid, dateString, progressData)
+}
+
 // Representing city details
 data class CityItem(
   val name: String,
@@ -309,37 +438,93 @@ data class CityItem(
 )
 
 @Composable
-fun FluentCityApp() {
+fun FluentCityApp(isDarkTheme: Boolean = true, onToggleTheme: () -> Unit = {}) {
+  val context = androidx.compose.ui.platform.LocalContext.current
+  val localStorageManager = remember(context) { LocalStorageManager(context) }
+
   val coroutineScope = rememberCoroutineScope()
+  
+  var isFirebaseLoading by remember { mutableStateOf(FirebaseManager.isFirebaseAvailable()) }
+  var firebaseUserId by remember { mutableStateOf(FirebaseManager.getCurrentUserId()) }
+  
   var currentScreen by remember { mutableStateOf(Screen.Landing) }
-  var onboardingData by remember { mutableStateOf(UserOnboardingData()) }
-  var completedDays by remember { mutableStateOf(setOf<Int>()) }
-  var confidenceRatings by remember { mutableStateOf(mapOf<Int, String>()) }
-  var sessionPerformanceScores by remember { mutableStateOf(mapOf<Int, Int>()) }
-  var sessionImprovements by remember { mutableStateOf(mapOf<Int, ImprovementDetail>()) }
+
+  LaunchedEffect(Unit) {
+    if (FirebaseManager.isFirebaseAvailable()) {
+      FirebaseManager.ensureAnonymousAuth { uid ->
+        if (uid != null) {
+          firebaseUserId = uid
+          FirebaseManager.syncFirestoreToSharedPreferences(uid, localStorageManager) { loadedFromFirestore ->
+            if (!loadedFromFirestore) {
+              val localHasProfile = localStorageManager.load<LearningProfile?>("learning_profile", null) != null
+              if (localHasProfile) {
+                FirebaseManager.syncSharedPreferencesToFirestore(uid, localStorageManager)
+              }
+            }
+            isFirebaseLoading = false
+          }
+        } else {
+          isFirebaseLoading = false
+        }
+      }
+    } else {
+      isFirebaseLoading = false
+    }
+  }
+  // Remove LaunchedEffect for current_screen since we want to show WelcomeBack on every open if progress exists
+  // Or we can just not save current_screen if we always evaluate it at startup.
+  
+  var onboardingData by remember { mutableStateOf(localStorageManager.load("onboarding_data", UserOnboardingData())) }
+  LaunchedEffect(onboardingData) { localStorageManager.save("onboarding_data", onboardingData) }
+
+  var completedDays by remember { mutableStateOf(localStorageManager.loadCompletedDays()) }
+  LaunchedEffect(completedDays) { localStorageManager.saveCompletedDays(completedDays) }
+
+  var confidenceRatings by remember { mutableStateOf(localStorageManager.loadConfidenceRatings()) }
+  LaunchedEffect(confidenceRatings) { localStorageManager.saveConfidenceRatings(confidenceRatings) }
+
+  var sessionPerformanceScores by remember { mutableStateOf(localStorageManager.loadSessionPerformanceScores()) }
+  LaunchedEffect(sessionPerformanceScores) { localStorageManager.saveSessionPerformanceScores(sessionPerformanceScores) }
+
+  var sessionImprovements by remember { mutableStateOf(localStorageManager.loadSessionImprovements()) }
+  LaunchedEffect(sessionImprovements) { localStorageManager.saveSessionImprovements(sessionImprovements) }
+
   var activePracticeTask by remember { mutableStateOf<DayTask?>(null) }
-  var selectedPracticeMode by remember { mutableStateOf("Coach me gently") }
-  var streakCount by remember { mutableStateOf(3) }
+  
+  var selectedPracticeMode by remember { mutableStateOf(localStorageManager.load("selected_practice_mode", "Coach me gently")) }
+  LaunchedEffect(selectedPracticeMode) { localStorageManager.save("selected_practice_mode", selectedPracticeMode) }
+  
+  var streakCount by remember { mutableStateOf(localStorageManager.load("streak_count", 3)) }
+  LaunchedEffect(streakCount) { localStorageManager.save("streak_count", streakCount) }
+  
   var showCelebrationDialog by remember { mutableStateOf<Int?>(null) }
   
   // Gemini calibration integration states
-  var calibrationResult by remember { mutableStateOf<CalibrationAnalysisResult?>(null) }
+  var calibrationResult by remember { mutableStateOf(localStorageManager.load<CalibrationAnalysisResult?>("calibration_result", null)) }
+  LaunchedEffect(calibrationResult) { localStorageManager.save("calibration_result", calibrationResult) }
+  
   var isCalibrating by remember { mutableStateOf(false) }
   var calibrationError by remember { mutableStateOf<String?>(null) }
-  var learningProfile by remember { mutableStateOf<LearningProfile?>(null) }
-  var customRegeneratedTasks by remember { mutableStateOf<Map<Int, DayTask>>(emptyMap()) }
+  
+  var learningProfile by remember { mutableStateOf(localStorageManager.load<LearningProfile?>("learning_profile", null)) }
+  LaunchedEffect(learningProfile) { localStorageManager.save("learning_profile", learningProfile) }
+  
+  var customRegeneratedTasks by remember { mutableStateOf(localStorageManager.loadCustomRegeneratedTasks()) }
+  LaunchedEffect(customRegeneratedTasks) { localStorageManager.saveCustomRegeneratedTasks(customRegeneratedTasks) }
 
   // Weekly reassessment states
-  var reassessmentHistory by remember { mutableStateOf(listOf<WeeklyReassessmentResult>()) }
-  var currentReassessmentAnswers by remember { mutableStateOf(WeeklyReassessmentAnswers()) }
+  var reassessmentHistory by remember { mutableStateOf(localStorageManager.loadReassessmentHistory()) }
+  LaunchedEffect(reassessmentHistory) { localStorageManager.saveReassessmentHistory(reassessmentHistory) }
+  
+  var currentReassessmentAnswers by remember { mutableStateOf(localStorageManager.load("current_reassessment_answers", WeeklyReassessmentAnswers())) }
+  LaunchedEffect(currentReassessmentAnswers) { localStorageManager.save("current_reassessment_answers", currentReassessmentAnswers) }
+  
   var activeReassessmentResult by remember { mutableStateOf<WeeklyReassessmentResult?>(null) }
   var isReassessing by remember { mutableStateOf(false) }
   var reassessmentError by remember { mutableStateOf<String?>(null) }
 
   // Spaced review system state tracking
-  var reviewItems by remember {
-    mutableStateOf(
-      listOf(
+  val defaultReviewItems = listOf(
         ReviewItem(
           id = "starter_1",
           type = "phrase",
@@ -361,13 +546,13 @@ fun FluentCityApp() {
           nextReviewTimeMillis = System.currentTimeMillis() // Due now!
         )
       )
-    )
-  }
-  var simulatedTimeOffsetDays by remember { mutableStateOf(0) }
+  var reviewItems by remember { mutableStateOf(localStorageManager.loadReviewItems(defaultReviewItems)) }
+  LaunchedEffect(reviewItems) { localStorageManager.saveReviewItems(reviewItems) }
+  
+  var simulatedTimeOffsetDays by remember { mutableStateOf(localStorageManager.load("simulated_time_offset", 0)) }
+  LaunchedEffect(simulatedTimeOffsetDays) { localStorageManager.save("simulated_time_offset", simulatedTimeOffsetDays) }
 
-  var recordedMistakes by remember {
-    mutableStateOf(
-      listOf(
+  val defaultRecordedMistakes = listOf(
         RecordedMistake(
           phrase = "I have sickness starting yesterday.",
           correction = "I've been feeling under the weather since yesterday.",
@@ -384,7 +569,44 @@ fun FluentCityApp() {
           category = "Grammar"
         )
       )
-    )
+  var recordedMistakes by remember { mutableStateOf(localStorageManager.loadRecordedMistakes(defaultRecordedMistakes)) }
+  LaunchedEffect(recordedMistakes) { localStorageManager.saveRecordedMistakes(recordedMistakes) }
+
+  LaunchedEffect(isFirebaseLoading) {
+    if (!isFirebaseLoading) {
+      onboardingData = localStorageManager.load("onboarding_data", UserOnboardingData())
+      completedDays = localStorageManager.loadCompletedDays()
+      confidenceRatings = localStorageManager.loadConfidenceRatings()
+      sessionPerformanceScores = localStorageManager.loadSessionPerformanceScores()
+      sessionImprovements = localStorageManager.loadSessionImprovements()
+      selectedPracticeMode = localStorageManager.load("selected_practice_mode", "Coach me gently")
+      streakCount = localStorageManager.load("streak_count", 3)
+      calibrationResult = localStorageManager.load<CalibrationAnalysisResult?>("calibration_result", null)
+      learningProfile = localStorageManager.load<LearningProfile?>("learning_profile", null)
+      customRegeneratedTasks = localStorageManager.loadCustomRegeneratedTasks()
+      reassessmentHistory = localStorageManager.loadReassessmentHistory()
+      currentReassessmentAnswers = localStorageManager.load("current_reassessment_answers", WeeklyReassessmentAnswers())
+      reviewItems = localStorageManager.loadReviewItems(defaultReviewItems)
+      simulatedTimeOffsetDays = localStorageManager.load("simulated_time_offset", 0)
+      recordedMistakes = localStorageManager.loadRecordedMistakes(defaultRecordedMistakes)
+
+      val hasProfile = localStorageManager.load<LearningProfile?>("learning_profile", null) != null
+      currentScreen = if (hasProfile) Screen.WelcomeBack else Screen.Landing
+    }
+  }
+
+  LaunchedEffect(
+    onboardingData, completedDays, confidenceRatings, sessionPerformanceScores,
+    sessionImprovements, selectedPracticeMode, streakCount, calibrationResult,
+    learningProfile, customRegeneratedTasks, reassessmentHistory,
+    currentReassessmentAnswers, reviewItems, simulatedTimeOffsetDays, recordedMistakes
+  ) {
+    if (!isFirebaseLoading) {
+      val uid = firebaseUserId
+      if (uid != null) {
+        FirebaseManager.syncSharedPreferencesToFirestore(uid, localStorageManager)
+      }
+    }
   }
 
   // Auto calibration when we land on check result and haven't processed it yet
@@ -395,7 +617,7 @@ fun FluentCityApp() {
         val result = GeminiAnalyzer.analyzeOnboardingAnswers(onboardingData)
         calibrationResult = result
         val profile = LearningProfile(
-          cefrLevel = result.estimatedLevel,
+          cefrLevel = result.estimatedLevel ?: "B1",
           selectedSkills = onboardingData.skillsToImprove,
           mainGoal = onboardingData.mainGoal,
           city = onboardingData.city,
@@ -405,7 +627,7 @@ fun FluentCityApp() {
           commonMistakes = result.commonMistakes ?: "Literal translation of local idioms or minor subject-verb mismatch.",
           preferredPracticeStyle = result.preferredPracticeStyle ?: when {
             onboardingData.practiceMinutes <= 10 -> "quick practice"
-            result.estimatedLevel.startsWith("C") -> "challenge mode"
+            result.estimatedLevel?.startsWith("C") == true -> "challenge mode"
             onboardingData.mainGoal.lowercase().contains("social") -> "roleplay"
             else -> "correction-focused"
           }
@@ -433,7 +655,7 @@ fun FluentCityApp() {
         systemResponse = planTask.systemResponse,
         localTip = planTask.localTip
       )
-    } ?: get7DayLearningPlan(onboardingData.city, onboardingData.mainGoal)
+    } ?: get7DayLearningPlan(onboardingData.city, onboardingData.mainGoal, onboardingData.skillsToImprove)
 
     val baseList = rawBaseList.map { task ->
       customRegeneratedTasks[task.day] ?: task
@@ -524,10 +746,45 @@ fun FluentCityApp() {
   
   // High fidelity animations between transitions
   Box(modifier = Modifier.fillMaxSize()) {
-    when (currentScreen) {
+    if (isFirebaseLoading) {
+      Box(
+        modifier = Modifier
+          .fillMaxSize()
+          .background(MaterialTheme.colorScheme.background),
+        contentAlignment = Alignment.Center
+      ) {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.Center
+        ) {
+          androidx.compose.material3.CircularProgressIndicator(
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.size(48.dp)
+          )
+          Spacer(modifier = Modifier.height(16.dp))
+          Text(
+            text = "Connecting to FluentCity...",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onBackground
+          )
+        }
+      }
+    } else {
+      when (currentScreen) {
+      Screen.WelcomeBack -> {
+        FluentCityWelcomeBackScreen(
+          learningProfile = learningProfile,
+          completedDays = completedDays,
+          dayTasks = dayTasks,
+          onContinueLearning = { currentScreen = Screen.Dashboard },
+          onViewProgress = { currentScreen = Screen.Progress }
+        )
+      }
       Screen.Landing -> {
         FluentCityLandingPage(
           initialCity = onboardingData.city,
+          isDarkTheme = isDarkTheme,
+          onToggleTheme = onToggleTheme,
           onStartClick = { selectedCity ->
             onboardingData = onboardingData.copy(city = selectedCity)
             currentScreen = Screen.Onboarding
@@ -547,7 +804,7 @@ fun FluentCityApp() {
         )
       }
       Screen.SpeakingCheck -> {
-        FluentCitySpeakingCheckPage(
+        FluentCityAssessmentCheckPage(
           initialData = onboardingData,
           onComplete = { completedData ->
             onboardingData = completedData
@@ -570,6 +827,29 @@ fun FluentCityApp() {
             calibrationError = null
           },
           onContinue = {
+            val uid = firebaseUserId
+            if (uid != null) {
+              val userProfileMap = mapOf(
+                "createdAt" to System.currentTimeMillis(),
+                "lastActiveAt" to System.currentTimeMillis(),
+                "city" to onboardingData.city,
+                "selectedSkills" to listOf(onboardingData.skillsToImprove),
+                "mainGoal" to onboardingData.mainGoal,
+                "dailyPracticeMinutes" to onboardingData.practiceMinutes,
+                "onboardingCompleted" to true
+              )
+              FirebaseManager.updateUserProfile(uid, userProfileMap)
+
+              calibrationResult?.let { result ->
+                val skillData = mapOf(
+                  "skill" to "Speaking",
+                  "estimatedCEFR" to result.estimatedLevel,
+                  "score" to result.speakingScore,
+                  "lastAssessedAt" to System.currentTimeMillis()
+                )
+                FirebaseManager.updateSkillLevel(uid, "Speaking", skillData)
+              }
+            }
             currentScreen = Screen.Dashboard
           },
           onBack = {
@@ -579,6 +859,8 @@ fun FluentCityApp() {
       }
       Screen.Dashboard -> {
         FluentCityDashboardPage(
+          isDarkTheme = isDarkTheme,
+          onToggleTheme = onToggleTheme,
           onboardingData = onboardingData,
           dayTasks = dayTasks,
           completedDays = completedDays,
@@ -588,49 +870,13 @@ fun FluentCityApp() {
           onDismissCelebration = { showCelebrationDialog = null },
           onStartPractice = { task ->
             activePracticeTask = task
-            currentScreen = Screen.LessonValidation
+            currentScreen = Screen.PracticeModeSelection
           },
           onViewProgress = {
             currentScreen = Screen.Progress
           },
-          onReset = {
-            onboardingData = UserOnboardingData()
-            completedDays = emptySet()
-            streakCount = 3
-            showCelebrationDialog = null
-            activePracticeTask = null
-            calibrationResult = null
-            calibrationError = null
-            learningProfile = null
-            reassessmentHistory = emptyList()
-            currentReassessmentAnswers = WeeklyReassessmentAnswers()
-            activeReassessmentResult = null
-            isReassessing = false
-            reassessmentError = null
-            reviewItems = listOf(
-              ReviewItem(
-                id = "starter_1",
-                type = "phrase",
-                context = "Day 1: Coffee Order Prep",
-                originalPrompt = "How do you politely order a flat white and a croissant to go at a British café?",
-                targetPhrase = "Could I grab a flat white and a croissant to go, please?",
-                explanation = "Polite indirect verbs like 'Could I grab' paired with 'please' and 'to go' make it perfectly local.",
-                intervalStep = 0,
-                nextReviewTimeMillis = System.currentTimeMillis()
-              ),
-              ReviewItem(
-                id = "starter_2",
-                type = "mistake",
-                context = "Day 2: Clinical Care",
-                originalPrompt = "Correct this literal translation: \"I have sickness starting yesterday.\"",
-                targetPhrase = "I've been feeling under the weather since yesterday.",
-                explanation = "The perfect Southern British idiomatic expression. 'Under the weather' means slightly unwell.",
-                intervalStep = 0,
-                nextReviewTimeMillis = System.currentTimeMillis()
-              )
-            )
-            simulatedTimeOffsetDays = 0
-            currentScreen = Screen.Landing
+          onOpenSettings = {
+            currentScreen = Screen.Settings
           },
           reviewItems = reviewItems,
           simulatedTimeOffsetDays = simulatedTimeOffsetDays,
@@ -669,7 +915,12 @@ fun FluentCityApp() {
             selectedMode = selectedPracticeMode,
             onModeSelected = { selectedPracticeMode = it },
             onBack = { currentScreen = Screen.Dashboard },
-            onContinue = { currentScreen = Screen.PracticeChat }
+            onContinue = { 
+              val isSpeaking = onboardingData.skillsToImprove.equals("Speaking", ignoreCase = true) || 
+                               task.title.contains("Speaking", ignoreCase = true) || 
+                               task.practiceGoal.contains("Speak", ignoreCase = true)
+              currentScreen = if (isSpeaking) Screen.VoicePractice else Screen.PracticeChat 
+            }
           )
         }
       }
@@ -760,6 +1011,155 @@ fun FluentCityApp() {
               val uniqueNewReviews = newReviews.filter { it.targetPhrase !in currentIds }
               reviewItems = reviewItems + uniqueNewReviews
               
+              saveSessionDataToFirestore(
+                uid = firebaseUserId,
+                task = task,
+                city = onboardingData.city,
+                score = score,
+                confidence = confidence,
+                feedback = feedback,
+                uniqueNewReviews = uniqueNewReviews,
+                completedDays = completedDays.size,
+                confidenceRatings = confidenceRatings,
+                isVoice = false
+              )
+
+              currentScreen = Screen.Dashboard
+            },
+            onMistakeRecorded = { phrase, correctionText, category ->
+              val normalizedCategory = if (category.isNotBlank() && category != "None") {
+                category
+              } else {
+                determineCategoryFromCorrection(correctionText)
+              }
+              
+              if (normalizedCategory != "None" && correctionText.isNotBlank() && 
+                  !correctionText.contains("Excellent", ignoreCase = true) && 
+                  !correctionText.contains("Perfect", ignoreCase = true) &&
+                  !correctionText.contains("Spotless", ignoreCase = true) &&
+                  !correctionText.contains("great job", ignoreCase = true) &&
+                  !correctionText.contains("well done", ignoreCase = true)
+              ) {
+                val existingMistake = recordedMistakes.find { it.phrase.equals(phrase, ignoreCase = true) }
+                if (existingMistake != null) {
+                  recordedMistakes = recordedMistakes.map {
+                    if (it.id == existingMistake.id) it.copy(occurrenceCount = it.occurrenceCount + 1) else it
+                  }
+                } else {
+                  recordedMistakes = recordedMistakes + RecordedMistake(
+                    phrase = phrase,
+                    correction = correctionText,
+                    category = normalizedCategory,
+                    occurrenceCount = 1
+                  )
+                }
+              }
+            },
+            confidenceRatings = confidenceRatings,
+            sessionPerformanceScores = sessionPerformanceScores
+          )
+        }
+      }
+      Screen.VoicePractice -> {
+        activePracticeTask?.let { task ->
+          FluentCityVoicePracticeScreen(
+            task = task,
+            cityName = onboardingData.city,
+            learningProfile = learningProfile,
+            practiceMode = selectedPracticeMode,
+            recordedMistakes = recordedMistakes,
+            onBack = {
+              currentScreen = Screen.Dashboard
+            },
+            onCompleted = { day, feedback, phrases, confidence ->
+              completedDays = completedDays + day
+              confidenceRatings = confidenceRatings + (day to confidence)
+              
+              val score = feedback?.let { 
+                (it.taskCompletion.score + 
+                 it.grammar.score + 
+                 it.vocabulary.score + 
+                 it.fluency.score + 
+                 it.naturalness.score + 
+                 it.formalityMatch.score + 
+                 it.clarity.score) / 7 
+              } ?: 75
+              sessionPerformanceScores = sessionPerformanceScores + (day to score)
+              feedback?.improvement?.let { imp ->
+                sessionImprovements = sessionImprovements + (day to imp)
+              }
+              
+              streakCount = streakCount + 1
+              showCelebrationDialog = day
+              
+              val newReviews = mutableListOf<ReviewItem>()
+              
+              // 1. Save the 3 useful phrases of the day
+              phrases.forEach { (phrase, explanation) ->
+                newReviews.add(
+                  ReviewItem(
+                    type = "phrase",
+                    context = "Day $day: ${task.title}",
+                    originalPrompt = "Recall this useful phrase to: $explanation",
+                    targetPhrase = phrase,
+                    explanation = explanation
+                  )
+                )
+              }
+              
+              // 2. Save mistake if feedback exists and is valid
+              feedback?.let { fb ->
+                val mainCorrection = fb.grammar.correction
+                val mainNatural = fb.grammar.naturalVersion
+                if (mainCorrection.isNotBlank() && mainNatural.isNotBlank() && 
+                    !mainCorrection.contains("None", ignoreCase = true) && 
+                    !mainCorrection.contains("No major", ignoreCase = true) && 
+                    !mainCorrection.contains("Excellent", ignoreCase = true)) {
+                  newReviews.add(
+                    ReviewItem(
+                      type = "mistake",
+                      context = "Correction from Day $day",
+                      originalPrompt = "Correct this previous mistake: \"${mainCorrection}\"",
+                      targetPhrase = mainNatural,
+                      explanation = "Natural British structure: \"${mainNatural}\" (explanation: \"${fb.grammar.explanation}\")"
+                    )
+                  )
+                  
+                  // ALSO record the final session mistake in memory
+                  val categoryOfFeedback = determineCategoryFromCorrection(mainCorrection)
+                  val existingMistake = recordedMistakes.find { it.phrase.equals(mainCorrection, ignoreCase = true) }
+                  if (existingMistake != null) {
+                    recordedMistakes = recordedMistakes.map {
+                      if (it.id == existingMistake.id) it.copy(occurrenceCount = it.occurrenceCount + 1) else it
+                    }
+                  } else {
+                    recordedMistakes = recordedMistakes + RecordedMistake(
+                      phrase = mainCorrection,
+                      correction = mainNatural,
+                      category = categoryOfFeedback,
+                      occurrenceCount = 1
+                    )
+                  }
+                }
+              }
+              
+              val currentIds = reviewItems.map { m -> m.targetPhrase }.toSet()
+              val uniqueNewReviews = newReviews.filter { it.targetPhrase !in currentIds }
+              reviewItems = reviewItems + uniqueNewReviews
+              
+              saveSessionDataToFirestore(
+                uid = firebaseUserId,
+                task = task,
+                city = onboardingData.city,
+                score = score,
+                confidence = confidence,
+                feedback = feedback,
+                uniqueNewReviews = uniqueNewReviews,
+                completedDays = completedDays.size,
+                confidenceRatings = confidenceRatings,
+                isVoice = true
+              )
+
               currentScreen = Screen.Dashboard
             },
             onMistakeRecorded = { phrase, correctionText, category ->
@@ -874,6 +1274,363 @@ fun FluentCityApp() {
           }
         )
       }
+      Screen.Settings -> {
+        FluentCitySettingsScreen(
+          onBack = { currentScreen = Screen.Dashboard },
+          onResetProgress = {
+            localStorageManager.clearAll()
+            onboardingData = UserOnboardingData()
+            completedDays = emptySet()
+            confidenceRatings = emptyMap()
+            sessionPerformanceScores = emptyMap()
+            sessionImprovements = emptyMap()
+            selectedPracticeMode = "Coach me gently"
+            streakCount = 3
+            showCelebrationDialog = null
+            activePracticeTask = null
+            calibrationResult = null
+            calibrationError = null
+            learningProfile = null
+            customRegeneratedTasks = emptyMap()
+            reassessmentHistory = emptyList()
+            currentReassessmentAnswers = WeeklyReassessmentAnswers()
+            activeReassessmentResult = null
+            isReassessing = false
+            reassessmentError = null
+            reviewItems = defaultReviewItems
+            simulatedTimeOffsetDays = 0
+            recordedMistakes = defaultRecordedMistakes
+            currentScreen = Screen.Landing
+          },
+          onCreateAccount = { currentScreen = Screen.CreateAccount }
+        )
+      }
+      Screen.CreateAccount -> {
+        CreateAccountScreen(
+          onBack = { currentScreen = Screen.Settings },
+          onAccountCreated = {
+            // Keep their existing anonymous progress and navigate back
+            currentScreen = Screen.Dashboard
+          }
+        )
+      }
+    }
+  }
+}
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FluentCitySettingsScreen(
+  onBack: () -> Unit,
+  onResetProgress: () -> Unit,
+  onCreateAccount: () -> Unit
+) {
+  var showResetConfirmDialog by remember { mutableStateOf(false) }
+
+  Scaffold(
+    topBar = {
+      TopAppBar(
+        title = {
+          Text(
+            text = "Settings",
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface
+          )
+        },
+        navigationIcon = {
+          IconButton(onClick = onBack) {
+            Icon(
+              imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+              contentDescription = "Back",
+              tint = MaterialTheme.colorScheme.onSurface
+            )
+          }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(
+          containerColor = MaterialTheme.colorScheme.surface
+        )
+      )
+    },
+    containerColor = MaterialTheme.colorScheme.background
+  ) { paddingValues ->
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .padding(paddingValues)
+        .padding(16.dp)
+        .verticalScroll(rememberScrollState()),
+      horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+      Spacer(modifier = Modifier.height(24.dp))
+      
+      Card(
+        modifier = Modifier
+          .fillMaxWidth()
+          .widthIn(max = 600.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)
+      ) {
+        Column(modifier = Modifier.padding(24.dp)) {
+          Text(
+            text = "Account",
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.onSurface
+          )
+          Spacer(modifier = Modifier.height(8.dp))
+          Text(
+            text = "Create an account to save your progress across devices.",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+          )
+          Spacer(modifier = Modifier.height(16.dp))
+          Button(
+            onClick = onCreateAccount,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+          ) {
+            Text("Create Account", color = MaterialTheme.colorScheme.onPrimary)
+          }
+        }
+      }
+
+      Spacer(modifier = Modifier.height(24.dp))
+
+      Card(
+        modifier = Modifier
+          .fillMaxWidth()
+          .widthIn(max = 600.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)
+      ) {
+        Column(modifier = Modifier.padding(24.dp)) {
+          Text(
+            text = "Danger Zone",
+            fontWeight = FontWeight.Bold,
+            fontSize = 18.sp,
+            color = MaterialTheme.colorScheme.error
+          )
+          Spacer(modifier = Modifier.height(8.dp))
+          Text(
+            text = "Resetting your progress is permanent. You will lose all your data.",
+            fontSize = 14.sp,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+          )
+          Spacer(modifier = Modifier.height(24.dp))
+          
+          Button(
+            onClick = { showResetConfirmDialog = true },
+            modifier = Modifier
+              .fillMaxWidth()
+              .height(50.dp),
+            colors = ButtonDefaults.buttonColors(
+              containerColor = MaterialTheme.colorScheme.error,
+              contentColor = MaterialTheme.colorScheme.onError
+            ),
+            shape = RoundedCornerShape(12.dp)
+          ) {
+            Icon(Icons.Default.Delete, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Reset my progress", fontWeight = FontWeight.Bold)
+          }
+        }
+      }
+    }
+  }
+
+  if (showResetConfirmDialog) {
+    AlertDialog(
+      onDismissRequest = { showResetConfirmDialog = false },
+      title = {
+        Text("Are you sure?", fontWeight = FontWeight.Bold)
+      },
+      text = {
+        Text("This will delete your saved profile, progress, mistakes, reviews, and practice history from this device.")
+      },
+      confirmButton = {
+        Button(
+          onClick = {
+            showResetConfirmDialog = false
+            onResetProgress()
+          },
+          colors = ButtonDefaults.buttonColors(
+            containerColor = MaterialTheme.colorScheme.error
+          )
+        ) {
+          Text("Delete Everything")
+        }
+      },
+      dismissButton = {
+        TextButton(onClick = { showResetConfirmDialog = false }) {
+          Text("Cancel", color = MaterialTheme.colorScheme.onSurface)
+        }
+      },
+      containerColor = MaterialTheme.colorScheme.surface,
+      icon = {
+        Icon(Icons.Default.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error)
+      }
+    )
+  }
+}
+
+@Composable
+fun FluentCityWelcomeBackScreen(
+  learningProfile: LearningProfile?,
+  completedDays: Set<Int>,
+  dayTasks: List<DayTask>,
+  onContinueLearning: () -> Unit,
+  onViewProgress: () -> Unit
+) {
+  // Find next uncompleted task, fallback to day 1
+  val nextRecommendedTask = remember(dayTasks, completedDays) {
+    dayTasks.firstOrNull { !completedDays.contains(it.day) } ?: dayTasks.firstOrNull() ?: DayTask(
+        day = 1,
+        title = "Arrival",
+        icon = "🛬",
+        situation = "At the airport",
+        practiceGoal = "Ask for directions",
+        phraseToSpeak = "Excuse me",
+        systemResponse = "Yes?",
+        localTip = "Politeness is key"
+    )
+  }
+
+  Scaffold(
+    modifier = Modifier.fillMaxSize(),
+    containerColor = MaterialTheme.colorScheme.background
+  ) { paddingValues ->
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .padding(paddingValues)
+        .padding(24.dp),
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.Center
+    ) {
+      Box(
+        modifier = Modifier
+          .size(80.dp)
+          .clip(CircleShape)
+          .background(MaterialTheme.colorScheme.primaryContainer),
+        contentAlignment = Alignment.Center
+      ) {
+        Text("👋", fontSize = 40.sp)
+      }
+      
+      Spacer(modifier = Modifier.height(24.dp))
+      
+      Text(
+        text = "Welcome back!",
+        style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.ExtraBold),
+        color = MaterialTheme.colorScheme.onBackground
+      )
+      
+      Spacer(modifier = Modifier.height(32.dp))
+      
+      Card(
+        modifier = Modifier
+          .fillMaxWidth()
+          .widthIn(max = 500.dp)
+          .shadow(4.dp, RoundedCornerShape(16.dp)),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+        shape = RoundedCornerShape(16.dp)
+      ) {
+        Column(modifier = Modifier.padding(20.dp)) {
+          Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Star, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+              Text("Estimated Level", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+              Text(
+                text = learningProfile?.cefrLevel ?: "Unknown",
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                color = MaterialTheme.colorScheme.onSurface
+              )
+            }
+          }
+          
+          Spacer(modifier = Modifier.height(16.dp))
+          DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f))
+          Spacer(modifier = Modifier.height(16.dp))
+          
+          Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.secondary)
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+              Text("Missions Completed", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+              Text(
+                text = "${completedDays.size}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 16.sp,
+                color = MaterialTheme.colorScheme.onSurface
+              )
+            }
+          }
+          
+          Spacer(modifier = Modifier.height(16.dp))
+          DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f))
+          Spacer(modifier = Modifier.height(16.dp))
+          
+          Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                modifier = Modifier
+                  .size(32.dp)
+                  .clip(CircleShape)
+                  .background(MaterialTheme.colorScheme.tertiaryContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(text = nextRecommendedTask.icon, fontSize = 16.sp)
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column {
+              Text("Today's Practice", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+              Text(
+                text = "Day ${nextRecommendedTask.day}: ${nextRecommendedTask.title}",
+                fontWeight = FontWeight.Bold,
+                fontSize = 14.sp,
+                color = MaterialTheme.colorScheme.onSurface
+              )
+            }
+          }
+        }
+      }
+      
+      Spacer(modifier = Modifier.height(48.dp))
+      
+      Button(
+        onClick = onContinueLearning,
+        modifier = Modifier
+          .fillMaxWidth()
+          .widthIn(max = 400.dp)
+          .height(56.dp)
+          .shadow(8.dp, RoundedCornerShape(28.dp)),
+        colors = ButtonDefaults.buttonColors(
+          containerColor = MaterialTheme.colorScheme.primary,
+          contentColor = MaterialTheme.colorScheme.onPrimary
+        ),
+        shape = RoundedCornerShape(28.dp)
+      ) {
+        Text("Continue Learning", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+      }
+      
+      Spacer(modifier = Modifier.height(16.dp))
+      
+      OutlinedButton(
+        onClick = onViewProgress,
+        modifier = Modifier
+          .fillMaxWidth()
+          .widthIn(max = 400.dp)
+          .height(56.dp),
+        colors = ButtonDefaults.outlinedButtonColors(
+          contentColor = MaterialTheme.colorScheme.primary
+        ),
+        border = BorderStroke(2.dp, MaterialTheme.colorScheme.primary),
+        shape = RoundedCornerShape(28.dp)
+      ) {
+        Text("View Progress", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+      }
     }
   }
 }
@@ -882,6 +1639,8 @@ fun FluentCityApp() {
 @Composable
 fun FluentCityLandingPage(
   initialCity: String,
+  isDarkTheme: Boolean = true,
+  onToggleTheme: () -> Unit = {},
   onStartClick: (String) -> Unit
 ) {
   val scrollState = rememberScrollState()
@@ -925,9 +1684,17 @@ fun FluentCityLandingPage(
               fontWeight = FontWeight.ExtraBold,
               letterSpacing = (-0.5).sp
             ),
-            color = Color.White
+            color = MaterialTheme.colorScheme.onSurface
           )
           Spacer(modifier = Modifier.weight(1f))
+          IconButton(onClick = onToggleTheme) {
+            Icon(
+              imageVector = if (isDarkTheme) Icons.Default.Info else Icons.Default.Star,
+              contentDescription = "Toggle Theme",
+              tint = MaterialTheme.colorScheme.onSurface
+            )
+          }
+          Spacer(modifier = Modifier.width(8.dp))
           Box(
             modifier = Modifier
               .clip(CapsuleShape)
@@ -939,7 +1706,7 @@ fun FluentCityLandingPage(
                 modifier = Modifier
                   .size(6.dp)
                   .clip(CircleShape)
-                  .background(Color(0xFF10B981))
+                  .background(MaterialTheme.colorScheme.tertiary)
               )
               Spacer(modifier = Modifier.width(6.dp))
               Text(
@@ -979,7 +1746,7 @@ fun FluentCityLandingPage(
             letterSpacing = (-1).sp,
             lineHeight = 40.sp
           ),
-          color = Color.White,
+          color = MaterialTheme.colorScheme.onSurface,
           modifier = Modifier
             .fillMaxWidth()
             .widthIn(max = 480.dp)
@@ -992,7 +1759,7 @@ fun FluentCityLandingPage(
           text = "Speak real-world English with interactive voice scenarios customized to your local city.",
           style = MaterialTheme.typography.bodyLarge,
           textAlign = TextAlign.Center,
-          color = Color.White.copy(alpha = 0.75f),
+          color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
           modifier = Modifier
             .fillMaxWidth()
             .widthIn(max = 440.dp)
@@ -1011,7 +1778,7 @@ fun FluentCityLandingPage(
           Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
           ) {
             Row(
@@ -1021,7 +1788,7 @@ fun FluentCityLandingPage(
               Box(
                 modifier = Modifier
                   .size(48.dp)
-                  .background(Color(0xFFE6F4EA), CircleShape),
+                  .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
                 contentAlignment = Alignment.Center
               ) {
                 Text(text = "💬", fontSize = 24.sp)
@@ -1031,13 +1798,13 @@ fun FluentCityLandingPage(
                 Text(
                   text = "Practise real conversations",
                   style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                  color = Color(0xFF0F172A)
+                  color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                   text = "Talk to locals at cafés, on the train, or at work.",
                   style = MaterialTheme.typography.bodyMedium,
-                  color = Color(0xFF475569)
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
               }
             }
@@ -1047,7 +1814,7 @@ fun FluentCityLandingPage(
           Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
           ) {
             Row(
@@ -1057,7 +1824,7 @@ fun FluentCityLandingPage(
               Box(
                 modifier = Modifier
                   .size(48.dp)
-                  .background(Color(0xFFE6F4EA), CircleShape),
+                  .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
                 contentAlignment = Alignment.Center
               ) {
                 Text(text = "⚡", fontSize = 24.sp)
@@ -1067,13 +1834,13 @@ fun FluentCityLandingPage(
                 Text(
                   text = "Get instant corrections",
                   style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                  color = Color(0xFF0F172A)
+                  color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                   text = "Get immediate feedback on grammar, tone, and local expressions.",
                   style = MaterialTheme.typography.bodyMedium,
-                  color = Color(0xFF475569)
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
               }
             }
@@ -1083,7 +1850,7 @@ fun FluentCityLandingPage(
           Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
           ) {
             Row(
@@ -1093,7 +1860,7 @@ fun FluentCityLandingPage(
               Box(
                 modifier = Modifier
                   .size(48.dp)
-                  .background(Color(0xFFE6F4EA), CircleShape),
+                  .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
                 contentAlignment = Alignment.Center
               ) {
                 Text(text = "📍", fontSize = 24.sp)
@@ -1103,13 +1870,13 @@ fun FluentCityLandingPage(
                 Text(
                   text = "Learn English for your city",
                   style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                  color = Color(0xFF0F172A)
+                  color = MaterialTheme.colorScheme.onSurface
                 )
                 Spacer(modifier = Modifier.height(4.dp))
                 Text(
                   text = "Learn regional terms, local slang, and transit routes.",
                   style = MaterialTheme.typography.bodyMedium,
-                  color = Color(0xFF475569)
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
               }
             }
@@ -1136,8 +1903,8 @@ fun FluentCityLandingPage(
               .shadow(8.dp, RoundedCornerShape(28.dp)),
             shape = RoundedCornerShape(28.dp),
             colors = ButtonDefaults.buttonColors(
-              containerColor = Color(0xFF14B8A6), // Premium Turquoise Accent
-              contentColor = Color.White
+              containerColor = MaterialTheme.colorScheme.primary, // Premium Turquoise Accent
+              contentColor = MaterialTheme.colorScheme.onPrimary
             )
           ) {
             Row(
@@ -1153,7 +1920,7 @@ fun FluentCityLandingPage(
               )
               Spacer(modifier = Modifier.width(8.dp))
               Icon(
-                imageVector = Icons.Default.ArrowForward,
+                imageVector = Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = null,
                 modifier = Modifier.size(20.dp)
               )
@@ -1209,22 +1976,22 @@ fun FluentCityOnboardingPage(
             }
           ) {
             Icon(
-              imageVector = Icons.Default.ArrowBack,
+              imageVector = Icons.AutoMirrored.Filled.ArrowBack,
               contentDescription = "Back Step",
-              tint = Color.White
+              tint = MaterialTheme.colorScheme.onSurface
             )
           }
           Spacer(modifier = Modifier.width(8.dp))
           Text(
             text = "Create Your Plan",
             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-            color = Color.White
+            color = MaterialTheme.colorScheme.onSurface
           )
           Spacer(modifier = Modifier.weight(1f))
           Text(
             text = "Step $step of $maxSteps",
             style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
-            color = Color(0xFF14B8A6)
+            color = MaterialTheme.colorScheme.primary
           )
         }
         LinearProgressIndicator(
@@ -1232,14 +1999,14 @@ fun FluentCityOnboardingPage(
           modifier = Modifier
             .fillMaxWidth()
             .height(4.dp),
-          color = Color(0xFF14B8A6),
-          trackColor = Color.White.copy(alpha = 0.1f)
+          color = MaterialTheme.colorScheme.primary,
+          trackColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.1f)
         )
       }
     },
     bottomBar = {
       Surface(
-        color = MaterialTheme.colorScheme.background,
+        color = MaterialTheme.colorScheme.background.copy(alpha = 0.9f),
         modifier = Modifier
           .fillMaxWidth()
           .navigationBarsPadding()
@@ -1271,8 +2038,8 @@ fun FluentCityOnboardingPage(
               .testTag("onboarding_next_button")
               .shadow(8.dp, RoundedCornerShape(28.dp)),
             colors = ButtonDefaults.buttonColors(
-              containerColor = Color(0xFF14B8A6),
-              contentColor = Color.White
+              containerColor = MaterialTheme.colorScheme.primary,
+              contentColor = MaterialTheme.colorScheme.onPrimary
             ),
             shape = RoundedCornerShape(28.dp)
           ) {
@@ -1285,7 +2052,7 @@ fun FluentCityOnboardingPage(
               )
               Spacer(modifier = Modifier.width(8.dp))
               Icon(
-                imageVector = if (step == maxSteps) Icons.Default.CheckCircle else Icons.Default.ArrowForward,
+                imageVector = if (step == maxSteps) Icons.Default.CheckCircle else Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = null,
                 modifier = Modifier.size(20.dp)
               )
@@ -1316,7 +2083,7 @@ fun FluentCityOnboardingPage(
             .widthIn(max = 500.dp)
             .shadow(8.dp, RoundedCornerShape(24.dp)),
           shape = RoundedCornerShape(24.dp),
-          colors = CardDefaults.cardColors(containerColor = Color.White)
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
         ) {
           Column(
             modifier = Modifier.padding(24.dp),
@@ -1351,7 +2118,7 @@ fun FluentCityOnboardingPage(
           }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(40.dp))
       }
     }
   }
@@ -1374,13 +2141,13 @@ fun StepCityInput(
     Box(
       modifier = Modifier
         .size(64.dp)
-        .background(Color(0xFFE6F4EA), CircleShape),
+        .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
       contentAlignment = Alignment.Center
     ) {
       Icon(
         imageVector = Icons.Default.LocationOn,
         contentDescription = null,
-        tint = Color(0xFF14B8A6),
+        tint = MaterialTheme.colorScheme.primary,
         modifier = Modifier.size(32.dp)
       )
     }
@@ -1390,7 +2157,7 @@ fun StepCityInput(
     Text(
       text = "What city do you live in?",
       style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-      color = Color(0xFF0F172A),
+      color = MaterialTheme.colorScheme.onSurface,
       textAlign = TextAlign.Center
     )
 
@@ -1399,7 +2166,7 @@ fun StepCityInput(
     Text(
       text = "We will adapt situations, slang, and local habits to your city. Get ready for real conversations!",
       style = MaterialTheme.typography.bodyMedium,
-      color = Color(0xFF475569),
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
       textAlign = TextAlign.Center
     )
 
@@ -1418,14 +2185,19 @@ fun StepCityInput(
         onDone = { focusManager.clearFocus() }
       ),
       colors = OutlinedTextFieldDefaults.colors(
-        focusedTextColor = Color(0xFF0F172A),
-        unfocusedTextColor = Color(0xFF0F172A),
-        focusedBorderColor = Color(0xFF14B8A6),
-        unfocusedBorderColor = Color(0xFFCBD5E1),
-        focusedLabelColor = Color(0xFF14B8A6),
-        unfocusedLabelColor = Color(0xFF64748B)
+        focusedTextColor = MaterialTheme.colorScheme.onSurface,
+        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+        focusedContainerColor = MaterialTheme.colorScheme.surface,
+        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+        focusedBorderColor = MaterialTheme.colorScheme.primary,
+        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+        focusedLabelColor = MaterialTheme.colorScheme.primary,
+        unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        cursorColor = MaterialTheme.colorScheme.primary
       ),
-      shape = RoundedCornerShape(12.dp),
+      shape = RoundedCornerShape(16.dp),
       modifier = Modifier
         .fillMaxWidth()
         .testTag("onboarding_city_textbox")
@@ -1436,7 +2208,7 @@ fun StepCityInput(
     Text(
       text = "Or choose a quick template:",
       style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-      color = Color(0xFF0F172A)
+      color = MaterialTheme.colorScheme.onSurface
     )
 
     Spacer(modifier = Modifier.height(12.dp))
@@ -1449,38 +2221,23 @@ fun StepCityInput(
     ) {
       popularPresetCities.forEach { currentPreset ->
         val isSelected = city.trim().equals(currentPreset, ignoreCase = true)
-        val chipBg by animateColorAsState(
-          targetValue = if (isSelected) Color(0xFF14B8A6) else Color(0xFFF1F5F9),
-          label = "preset_chip_bg"
+        
+        FilterChip(
+          selected = isSelected,
+          onClick = {
+            onCityChange(currentPreset)
+            focusManager.clearFocus()
+          },
+          label = { Text(currentPreset) },
+          colors = FilterChipDefaults.filterChipColors(
+            selectedContainerColor = MaterialTheme.colorScheme.primary,
+            selectedLabelColor = MaterialTheme.colorScheme.onPrimary,
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+            labelColor = MaterialTheme.colorScheme.onSurfaceVariant
+          ),
+          modifier = Modifier.padding(horizontal = 4.dp),
+          shape = RoundedCornerShape(16.dp)
         )
-        val chipText by animateColorAsState(
-          targetValue = if (isSelected) Color.White else Color(0xFF475569),
-          label = "preset_chip_txt"
-        )
-
-        Box(
-          modifier = Modifier
-            .padding(horizontal = 4.dp)
-            .clip(RoundedCornerShape(18.dp))
-            .background(chipBg)
-            .clickable {
-              onCityChange(currentPreset)
-              focusManager.clearFocus()
-            }
-            .border(
-              width = 1.dp,
-              color = if (isSelected) Color.Transparent else Color(0xFFE2E8F0),
-              shape = RoundedCornerShape(18.dp)
-            )
-            .padding(horizontal = 14.dp, vertical = 8.dp)
-        ) {
-          Text(
-            text = currentPreset,
-            color = chipText,
-            fontWeight = FontWeight.SemiBold,
-            fontSize = 12.sp
-          )
-        }
       }
     }
   }
@@ -1509,13 +2266,13 @@ fun StepSkillSelector(
     Box(
       modifier = Modifier
         .size(64.dp)
-        .background(Color(0xFFE6F4EA), CircleShape),
+        .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
       contentAlignment = Alignment.Center
     ) {
       Icon(
         imageVector = Icons.Default.Star,
         contentDescription = null,
-        tint = Color(0xFF14B8A6),
+        tint = MaterialTheme.colorScheme.primary,
         modifier = Modifier.size(32.dp)
       )
     }
@@ -1525,7 +2282,7 @@ fun StepSkillSelector(
     Text(
       text = "What do you want to improve?",
       style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-      color = Color(0xFF0F172A),
+      color = MaterialTheme.colorScheme.onSurface,
       textAlign = TextAlign.Center
     )
 
@@ -1534,7 +2291,7 @@ fun StepSkillSelector(
     Text(
       text = "Choose what you want to focus on. Select all to train everything!",
       style = MaterialTheme.typography.bodyMedium,
-      color = Color(0xFF475569),
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
       textAlign = TextAlign.Center
     )
 
@@ -1543,8 +2300,8 @@ fun StepSkillSelector(
     // Vertical styled cards list
     options.forEach { (optionName, description) ->
       val isSelected = selectedSkill == optionName
-      val cardBgColor = if (isSelected) Color(0xFFE6F4EA) else Color(0xFFF8FAFC)
-      val cardBorderColor = if (isSelected) Color(0xFF14B8A6) else Color(0xFFE2E8F0)
+      val cardBgColor = if (isSelected) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surface
+      val cardBorderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
 
       Card(
         modifier = Modifier
@@ -1569,13 +2326,13 @@ fun StepSkillSelector(
               text = optionName,
               fontWeight = FontWeight.Bold,
               fontSize = 15.sp,
-              color = Color(0xFF0F172A)
+              color = MaterialTheme.colorScheme.onSurface
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
               text = description,
               fontSize = 12.sp,
-              color = Color(0xFF475569)
+              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
           }
 
@@ -1583,15 +2340,15 @@ fun StepSkillSelector(
             Icon(
               imageVector = Icons.Default.CheckCircle,
               contentDescription = "Selected",
-              tint = Color(0xFF14B8A6),
+              tint = MaterialTheme.colorScheme.primary,
               modifier = Modifier.size(22.dp)
             )
           } else {
             Box(
               modifier = Modifier
                 .size(20.dp)
-                .background(Color.White, CircleShape)
-                .border(2.dp, Color(0xFFCBD5E1), CircleShape)
+                .background(Color.Transparent, CircleShape)
+                .border(2.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
             )
           }
         }
@@ -1621,13 +2378,13 @@ fun StepGoalSelector(
     Box(
       modifier = Modifier
         .size(64.dp)
-        .background(Color(0xFFE6F4EA), CircleShape),
+        .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
       contentAlignment = Alignment.Center
     ) {
       Icon(
         imageVector = Icons.Default.Info,
         contentDescription = null,
-        tint = Color(0xFF14B8A6),
+        tint = MaterialTheme.colorScheme.primary,
         modifier = Modifier.size(32.dp)
       )
     }
@@ -1637,7 +2394,7 @@ fun StepGoalSelector(
     Text(
       text = "What is your main goal?",
       style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-      color = Color(0xFF0F172A),
+      color = MaterialTheme.colorScheme.onSurface,
       textAlign = TextAlign.Center
     )
 
@@ -1646,7 +2403,7 @@ fun StepGoalSelector(
     Text(
       text = "We will customize your daily roleplays and challenges to match this goal.",
       style = MaterialTheme.typography.bodyMedium,
-      color = Color(0xFF475569),
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
       textAlign = TextAlign.Center
     )
 
@@ -1655,8 +2412,8 @@ fun StepGoalSelector(
     // Goal Cards
     goalsList.forEach { (optionName, description) ->
       val isSelected = selectedGoal == optionName
-      val cardBgColor = if (isSelected) Color(0xFFE6F4EA) else Color(0xFFF8FAFC)
-      val cardBorderColor = if (isSelected) Color(0xFF14B8A6) else Color(0xFFE2E8F0)
+      val cardBgColor = if (isSelected) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surface
+      val cardBorderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
 
       Card(
         modifier = Modifier
@@ -1681,13 +2438,13 @@ fun StepGoalSelector(
               text = optionName,
               fontWeight = FontWeight.Bold,
               fontSize = 15.sp,
-              color = Color(0xFF0F172A)
+              color = MaterialTheme.colorScheme.onSurface
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
               text = description,
               fontSize = 12.sp,
-              color = Color(0xFF475569)
+              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
           }
 
@@ -1695,15 +2452,15 @@ fun StepGoalSelector(
             Icon(
               imageVector = Icons.Default.CheckCircle,
               contentDescription = "Selected",
-              tint = Color(0xFF14B8A6),
+              tint = MaterialTheme.colorScheme.primary,
               modifier = Modifier.size(22.dp)
             )
           } else {
             Box(
               modifier = Modifier
                 .size(20.dp)
-                .background(Color.White, CircleShape)
-                .border(2.dp, Color(0xFFCBD5E1), CircleShape)
+                .background(Color.Transparent, CircleShape)
+                .border(2.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
             )
           }
         }
@@ -1733,13 +2490,13 @@ fun StepMinutesSelector(
     Box(
       modifier = Modifier
         .size(64.dp)
-        .background(Color(0xFFE6F4EA), CircleShape),
+        .background(MaterialTheme.colorScheme.tertiaryContainer, CircleShape),
       contentAlignment = Alignment.Center
     ) {
       Icon(
         imageVector = Icons.Default.Warning,
         contentDescription = null,
-        tint = Color(0xFF14B8A6),
+        tint = MaterialTheme.colorScheme.primary,
         modifier = Modifier.size(32.dp)
       )
     }
@@ -1749,7 +2506,7 @@ fun StepMinutesSelector(
     Text(
       text = "Minutes to practice per day?",
       style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-      color = Color(0xFF0F172A),
+      color = MaterialTheme.colorScheme.onSurface,
       textAlign = TextAlign.Center
     )
 
@@ -1758,7 +2515,7 @@ fun StepMinutesSelector(
     Text(
       text = "Set a realistic daily goal to build a strong habit.",
       style = MaterialTheme.typography.bodyMedium,
-      color = Color(0xFF475569),
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
       textAlign = TextAlign.Center
     )
 
@@ -1767,8 +2524,8 @@ fun StepMinutesSelector(
     // Interactive custom time cards
     scheduleOptions.forEach { (mins, displayTitle) ->
       val isSelected = selectedMinutes == mins
-      val cardBgColor = if (isSelected) Color(0xFFE6F4EA) else Color(0xFFF8FAFC)
-      val cardBorderColor = if (isSelected) Color(0xFF14B8A6) else Color(0xFFE2E8F0)
+      val cardBgColor = if (isSelected) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.surface
+      val cardBorderColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
 
       Card(
         modifier = Modifier
@@ -1798,13 +2555,13 @@ fun StepMinutesSelector(
               text = displayTitle,
               fontWeight = FontWeight.Bold,
               fontSize = 15.sp,
-              color = Color(0xFF0F172A)
+              color = MaterialTheme.colorScheme.onSurface
             )
             Spacer(modifier = Modifier.height(4.dp))
             Text(
               text = "Cumulative year count: ${(mins * 365) / 60} hours of deliberate practice!",
               fontSize = 11.sp,
-              color = Color(0xFF475569)
+              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
           }
 
@@ -1812,15 +2569,15 @@ fun StepMinutesSelector(
             Icon(
               imageVector = Icons.Default.CheckCircle,
               contentDescription = "Selected",
-              tint = Color(0xFF14B8A6),
+              tint = MaterialTheme.colorScheme.primary,
               modifier = Modifier.size(22.dp)
             )
           } else {
             Box(
               modifier = Modifier
                 .size(20.dp)
-                .background(Color.White, CircleShape)
-                .border(2.dp, Color(0xFFCBD5E1), CircleShape)
+                .background(Color.Transparent, CircleShape)
+                .border(2.dp, MaterialTheme.colorScheme.outlineVariant, CircleShape)
             )
           }
         }
@@ -1841,7 +2598,7 @@ data class DayTask(
   val localTip: String
 )
 
-fun get7DayLearningPlan(city: String, goal: String): List<DayTask> {
+fun get7DayLearningPlan(city: String, goal: String, skills: String = "All"): List<DayTask> {
   val transitTerm = when (city) {
     "London" -> "Tube"
     "New York" -> "Subway"
@@ -1863,7 +2620,7 @@ fun get7DayLearningPlan(city: String, goal: String): List<DayTask> {
     else -> "in the city center"
   }
 
-  return listOf(
+  val baseTasks = listOf(
     DayTask(
       day = 1,
       title = "Ordering coffee in a busy café",
@@ -1935,11 +2692,32 @@ fun get7DayLearningPlan(city: String, goal: String): List<DayTask> {
       localTip = "Aim to balance technical highlights with a positive attitude towards team collaboration and local values."
     )
   )
+
+  return baseTasks.map { task ->
+    when {
+      skills.equals("Writing", ignoreCase = true) -> task.copy(
+        title = task.title.replace("Speaking", "Writing").replace("Ordering", "Messaging").replace("Asking", "Emailing"),
+        situation = task.situation.replace("speak", "write").replace("talk", "message").replace("saying", "emailing"),
+        practiceGoal = task.practiceGoal.replace("Clearly order", "Clearly write").replace("Express", "Write").replace("Use a casual", "Write a casual").replace("Politely describe", "Email to describe").replace("stop station staff", "message support").replace("Deliver", "Write")
+      )
+      skills.equals("Reading", ignoreCase = true) -> task.copy(
+        title = task.title.replace("Speaking", "Reading").replace("Ordering", "Reading the menu").replace("Asking", "Reading emails"),
+        practiceGoal = task.practiceGoal.replace("Clearly order", "Read").replace("Express", "Read").replace("Use a casual", "Read a casual").replace("Politely describe", "Read").replace("stop station staff", "read support message").replace("Deliver", "Read")
+      )
+      skills.equals("Listening", ignoreCase = true) -> task.copy(
+        title = task.title.replace("Speaking", "Listening").replace("Ordering", "Listening to order").replace("Asking", "Listening to"),
+        practiceGoal = task.practiceGoal.replace("Clearly order", "Listen to").replace("Express", "Listen to").replace("Use a casual", "Listen to a casual").replace("Politely describe", "Listen to").replace("stop station staff", "listen to support").replace("Deliver", "Listen")
+      )
+      else -> task
+    }
+  }
 }
 
 @OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun FluentCityDashboardPage(
+  isDarkTheme: Boolean = true,
+  onToggleTheme: () -> Unit = {},
   onboardingData: UserOnboardingData,
   dayTasks: List<DayTask>,
   completedDays: Set<Int>,
@@ -1949,7 +2727,7 @@ fun FluentCityDashboardPage(
   onDismissCelebration: () -> Unit,
   onStartPractice: (DayTask) -> Unit,
   onViewProgress: () -> Unit,
-  onReset: () -> Unit,
+  onOpenSettings: () -> Unit,
   reviewItems: List<ReviewItem>,
   simulatedTimeOffsetDays: Int,
   onStartReview: () -> Unit,
@@ -1957,867 +2735,109 @@ fun FluentCityDashboardPage(
   reassessmentHistory: List<WeeklyReassessmentResult> = emptyList(),
   onStartReassessment: () -> Unit = {}
 ) {
-  val scrollState = rememberScrollState()
-
-  val currentLevelBadgeText = remember(calibrationResult, completedDays) {
-    if (calibrationResult != null) {
-      calibrationResult.estimatedLevel
-    } else {
-      when {
-        completedDays.isEmpty() -> "B1"
-        completedDays.size <= 3 -> "B2"
-        else -> "C1"
-      }
-    }
-  }
-
-  if (celebrationDay != null) {
-    CelebrationDialog(
-      day = celebrationDay,
-      streakCount = streakCount,
-      practiceMinutesGained = onboardingData.practiceMinutes,
-      totalPracticeMinutes = 12 + (completedDays.size * onboardingData.practiceMinutes),
-      levelBadge = currentLevelBadgeText,
-      onDismiss = onDismissCelebration
-    )
+  val todayTask = remember(completedDays, dayTasks) {
+    val nextDayIdx = (completedDays.maxOrNull() ?: 0) + 1
+    dayTasks.find { it.day == nextDayIdx } ?: dayTasks.first()
   }
 
   Scaffold(
-    modifier = Modifier.fillMaxSize(),
     topBar = {
-      Box(
-        modifier = Modifier
-          .fillMaxWidth()
-          .background(MaterialTheme.colorScheme.background)
-          .padding(
-            top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 16.dp,
-            bottom = 8.dp,
-            start = 24.dp,
-            end = 24.dp
-          )
+      TopAppBar(
+        title = { Text("FluentCity", fontWeight = FontWeight.Bold) },
+        actions = {
+          // removed theme toggle icon to keep it simple
+        },
+        colors = TopAppBarDefaults.topAppBarColors(
+          containerColor = MaterialTheme.colorScheme.background
+        )
+      )
+    },
+    containerColor = MaterialTheme.colorScheme.background
+  ) { paddingValues ->
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .padding(paddingValues)
+        .padding(horizontal = 24.dp),
+      horizontalAlignment = Alignment.CenterHorizontally,
+      verticalArrangement = Arrangement.Center
+    ) {
+      Text(
+        text = "Ready for today's English?",
+        style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.ExtraBold),
+        color = MaterialTheme.colorScheme.primary,
+        textAlign = TextAlign.Center
+      )
+      
+      Spacer(modifier = Modifier.height(48.dp))
+      
+      Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
       ) {
-        Row(
-          verticalAlignment = Alignment.CenterVertically,
-          modifier = Modifier.fillMaxWidth()
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(24.dp),
+          horizontalAlignment = Alignment.CenterHorizontally
         ) {
-          Icon(
-            imageVector = Icons.Default.LocationOn,
-            contentDescription = null,
-            tint = Color(0xFF14B8A6),
-            modifier = Modifier.size(22.dp)
-          )
-          Spacer(modifier = Modifier.width(10.dp))
           Text(
-            text = "FluentCity AI Plan",
-            style = MaterialTheme.typography.titleLarge.copy(
-              fontWeight = FontWeight.ExtraBold,
-              letterSpacing = (-0.5).sp
-            ),
-            color = Color.White
+            text = "Mission ${todayTask.day}",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
           )
-          Spacer(modifier = Modifier.weight(1f))
-          TextButton(onClick = onReset) {
+          Spacer(modifier = Modifier.height(8.dp))
+          Text(
+            text = todayTask.title,
+            style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.Bold),
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+            textAlign = TextAlign.Center
+          )
+          Spacer(modifier = Modifier.height(16.dp))
+          Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-              text = "Reset Plan",
-              color = Color.White.copy(alpha = 0.65f),
-              fontWeight = FontWeight.Bold,
-              fontSize = 14.sp
+              text = "⏱️ ${onboardingData.practiceMinutes} min",
+              style = MaterialTheme.typography.bodyMedium,
+              color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.8f)
             )
           }
         }
       }
-    }
-  ) { paddingValues ->
-    Box(
-      modifier = Modifier
-        .fillMaxSize()
-        .background(MaterialTheme.colorScheme.background)
-        .padding(top = paddingValues.calculateTopPadding(), start = 20.dp, end = 20.dp)
-    ) {
-      Column(
+      
+      Spacer(modifier = Modifier.height(48.dp))
+      
+      Button(
+        onClick = { onStartPractice(todayTask) },
         modifier = Modifier
-          .fillMaxSize()
-          .verticalScroll(scrollState)
-          .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally
+          .fillMaxWidth()
+          .height(64.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
       ) {
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // Gamification Dashboard Stats Bar at the very top
-        GamificationStatsBar(
-          streakCount = streakCount,
-          practiceMinutes = 12 + (completedDays.size * onboardingData.practiceMinutes),
-          completedMissions = completedDays.size,
-          levelBadge = currentLevelBadgeText
-        )
-
-        Spacer(modifier = Modifier.height(10.dp))
-
-        // TODAY'S REVIEW SECTION CARD
-        val simulatedCurrentTime = remember(simulatedTimeOffsetDays) {
-          System.currentTimeMillis() + (simulatedTimeOffsetDays.toLong() * 24 * 60 * 60 * 1000)
-        }
-        val dueReviews = remember(reviewItems, simulatedCurrentTime) {
-          reviewItems.filter { simulatedCurrentTime >= it.nextReviewTimeMillis }
-        }
-        
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .padding(vertical = 8.dp)
-            .testTag("todays_review_card")
-            .border(
-              width = if (dueReviews.isNotEmpty()) 2.dp else 1.dp,
-              color = if (dueReviews.isNotEmpty()) Color(0xFFF59E0B) else Color(0xFFE2E8F0),
-              shape = RoundedCornerShape(16.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = if (dueReviews.isNotEmpty()) Color(0xFFFFFBEB) else Color.White
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              modifier = Modifier.fillMaxWidth()
-            ) {
-              Box(
-                modifier = Modifier
-                  .size(36.dp)
-                  .clip(CircleShape)
-                  .background(if (dueReviews.isNotEmpty()) Color(0xFFFEF3C7) else Color(0xFFF1F5F9)),
-                contentAlignment = Alignment.Center
-              ) {
-                Text(text = "🧠", fontSize = 18.sp)
-              }
-              Spacer(modifier = Modifier.width(12.dp))
-              Column(modifier = Modifier.weight(1f)) {
-                Text(
-                  text = "Today’s review",
-                  style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold),
-                  color = Color(0xFF0F172A)
-                )
-                Text(
-                  text = if (dueReviews.isNotEmpty()) "${dueReviews.size} item(s) scheduled for recall" else "All caught up! 0 pending review items",
-                  fontSize = 12.sp,
-                  color = if (dueReviews.isNotEmpty()) Color(0xFFB45309) else Color(0xFF64748B),
-                  fontWeight = FontWeight.Medium
-                )
-              }
-              
-              if (dueReviews.isNotEmpty()) {
-                Button(
-                  onClick = onStartReview,
-                  colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
-                  shape = RoundedCornerShape(12.dp),
-                  contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                  modifier = Modifier.height(36.dp).testTag("start_review_button")
-                ) {
-                  Text("Recall 🎯", fontSize = 11.sp, fontWeight = FontWeight.Black, color = Color.White)
-                }
-              } else if (reviewItems.isNotEmpty()) {
-                Button(
-                  onClick = onStartReview,
-                  colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF14B8A6)),
-                  shape = RoundedCornerShape(12.dp),
-                  contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                  modifier = Modifier.height(36.dp).testTag("cram_review_button")
-                ) {
-                  Text("Recall All 🧠", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                }
-              }
-            }
-            
-            // Fast developer control shortcuts for interactive review interval testing!
-            Spacer(modifier = Modifier.height(12.dp))
-            DividerHorizontal(color = if (dueReviews.isNotEmpty()) Color(0xFFF59E0B).copy(alpha = 0.15f) else Color(0xFFE2E8F0), thickness = 1.dp)
-            Spacer(modifier = Modifier.height(10.dp))
-            
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(8.dp),
-              modifier = Modifier.fillMaxWidth()
-            ) {
-              Text(
-                text = "Simulate intervals:",
-                fontSize = 10.sp,
-                color = Color(0xFF64748B),
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.weight(1f)
-              )
-              
-              listOf(
-                "Reset" to 0,
-                "+1 Day" to 1,
-                "+3 Days" to 3,
-                "+7 Days" to 7,
-                "+14 Days" to 14
-              ).forEach { (label, diff) ->
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(Color(0xFFE2E8F0))
-                    .clickable {
-                      if (diff == 0) {
-                        onSimulateTimeAdvance(-simulatedTimeOffsetDays)
-                      } else {
-                        onSimulateTimeAdvance(diff)
-                      }
-                    }
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                  Text(
-                    text = label,
-                    fontSize = 9.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF334155)
-                  )
-                }
-              }
-            }
-            
-            if (simulatedTimeOffsetDays > 0) {
-              Spacer(modifier = Modifier.height(6.dp))
-              Text(
-                text = "⏳ Simulated timeline: $simulatedTimeOffsetDays Day(s) into the future",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFF1D4ED8)
-              )
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(10.dp))
-
-        // Success profile layout card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              Color(0xFF10B981).copy(alpha = 0.25f),
-              RoundedCornerShape(16.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = Color(0xFF10B981).copy(alpha = 0.05f)
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(20.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                modifier = Modifier
-                  .size(36.dp)
-                  .clip(CircleShape)
-                  .background(Color(0xFF10B981)),
-                contentAlignment = Alignment.Center
-              ) {
-                Icon(
-                  imageVector = Icons.Default.Check,
-                  contentDescription = null,
-                  tint = Color.White,
-                  modifier = Modifier.size(20.dp)
-                )
-              }
-              Spacer(modifier = Modifier.width(12.dp))
-              Text(
-                text = "Your plan is ready.",
-                fontWeight = FontWeight.Bold,
-                fontSize = 16.sp,
-                color = Color(0xFF10B981)
-              )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-            DividerHorizontal(color = Color(0xFF10B981).copy(alpha = 0.15f))
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Profile info items
-            Row(
-              modifier = Modifier.fillMaxWidth(),
-              horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-              Column {
-                Text(
-                  text = "TARGET CITY",
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-                )
-                Text(
-                  text = onboardingData.city,
-                  fontSize = 14.sp,
-                  fontWeight = FontWeight.ExtraBold,
-                  color = MaterialTheme.colorScheme.primary
-                )
-              }
-
-              Column {
-                Text(
-                  text = "FOCUS AREA",
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-                )
-                Text(
-                  text = onboardingData.skillsToImprove,
-                  fontSize = 14.sp,
-                  fontWeight = FontWeight.ExtraBold,
-                  color = MaterialTheme.colorScheme.primary
-                )
-              }
-
-              Column {
-                Text(
-                  text = "DAILY GOAL",
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-                )
-                Text(
-                  text = "${onboardingData.practiceMinutes} mins/day",
-                  fontSize = 14.sp,
-                  fontWeight = FontWeight.ExtraBold,
-                  color = MaterialTheme.colorScheme.primary
-                )
-              }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-              text = "MAIN GOAL: ${onboardingData.mainGoal}",
-              fontSize = 12.sp,
-              fontWeight = FontWeight.SemiBold,
-              color = MaterialTheme.colorScheme.secondary
-            )
-          }
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // 7-day Progress card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
-              RoundedCornerShape(16.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.02f)
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(16.dp)) {
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              modifier = Modifier.fillMaxWidth()
-            ) {
-              Text(
-                text = "📅 7-Day Speaking Journey",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.onSurface
-              )
-              Spacer(modifier = Modifier.weight(1f))
-              Text(
-                text = "${completedDays.size} / 7 Days Done",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.primary
-              )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            LinearProgressIndicator(
-              progress = completedDays.size.toFloat() / 7f,
-              modifier = Modifier
-                .fillMaxWidth()
-                .height(6.dp)
-                .clip(RoundedCornerShape(3.dp)),
-              color = MaterialTheme.colorScheme.primary,
-              trackColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)
-            )
-
-            Spacer(modifier = Modifier.height(14.dp))
-
-            Button(
-              onClick = onViewProgress,
-              modifier = Modifier
-                .fillMaxWidth()
-                .height(40.dp)
-                .testTag("view_progress_button"),
-              colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.08f),
-                contentColor = MaterialTheme.colorScheme.primary
-              ),
-              shape = RoundedCornerShape(12.dp),
-              contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
-            ) {
-              Icon(
-                imageVector = Icons.Default.Info,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.primary
-              )
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = "View Detailed Progress Report",
-                fontSize = 12.sp,
-                fontWeight = FontWeight.ExtraBold
-              )
-            }
-          }
-        }
-
-        val isReassessmentAvailable = completedDays.size >= (reassessmentHistory.size + 1) * 7
-        
-        if (isReassessmentAvailable) {
-          Spacer(modifier = Modifier.height(16.dp))
-          Card(
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp)
-              .testTag("weekly_reassessment_banner")
-              .border(
-                2.dp,
-                Color(0xFFF59E0B),
-                RoundedCornerShape(16.dp)
-              ),
-            colors = CardDefaults.cardColors(
-              containerColor = Color(0xFFFEF3C7)
-            ),
-            shape = RoundedCornerShape(16.dp)
-          ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-              Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                  text = "🎯 Estimated Learning Progress Check Available!",
-                  style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Black),
-                  color = Color(0xFF92400E)
-                )
-              }
-              Spacer(modifier = Modifier.height(6.dp))
-              Text(
-                text = "You've successfully completed 7 practice sessions since your last check! Complete this short 4-step reassessment to see your progress, track improvements, and target your weaknesses next week.",
-                fontSize = 12.sp,
-                color = Color(0xFF78350F),
-                lineHeight = 16.sp
-              )
-              Spacer(modifier = Modifier.height(12.dp))
-              Button(
-                onClick = onStartReassessment,
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .height(44.dp)
-                  .testTag("start_reassessment_button"),
-                colors = ButtonDefaults.buttonColors(
-                  containerColor = Color(0xFFD97706),
-                  contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(12.dp)
-              ) {
-                Text("Start Reassessment ✍️", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-              }
-            }
-          }
-        } else {
-          Spacer(modifier = Modifier.height(16.dp))
-          Card(
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp)
-              .testTag("weekly_reassessment_optional_banner")
-              .border(
-                1.dp,
-                MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
-                RoundedCornerShape(16.dp)
-              ),
-            colors = CardDefaults.cardColors(
-              containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-            ),
-            shape = RoundedCornerShape(16.dp)
-          ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-              Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                  text = "Estimated Learning Progress Check",
-                  style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-                  color = MaterialTheme.colorScheme.onSurface
-                )
-                Spacer(modifier = Modifier.weight(1f))
-                Text(
-                  text = "${completedDays.size % 7} / 7 sessions",
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.primary
-                )
-              }
-              Spacer(modifier = Modifier.height(4.dp))
-              Text(
-                text = "Track your dynamic learning curve. Your next progress check unlocks automatically after ${7 - (completedDays.size % 7)} more practice sessions. You can also start one manually anytime.",
-                fontSize = 11.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f),
-                lineHeight = 15.sp
-              )
-              Spacer(modifier = Modifier.height(10.dp))
-              Button(
-                onClick = onStartReassessment,
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .height(36.dp)
-                  .testTag("start_reassessment_manual_button"),
-                colors = ButtonDefaults.buttonColors(
-                  containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.12f),
-                  contentColor = MaterialTheme.colorScheme.primary
-                ),
-                shape = RoundedCornerShape(10.dp)
-              ) {
-                Text("Take Learning Progress Check", fontWeight = FontWeight.Bold, fontSize = 12.sp)
-              }
-            }
-          }
-        }
-
-        if (reassessmentHistory.isNotEmpty()) {
-          Spacer(modifier = Modifier.height(16.dp))
-          Text(
-            text = "📈 Learning Progress Check History",
-            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-            color = MaterialTheme.colorScheme.onBackground,
-            modifier = Modifier.fillMaxWidth()
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          reassessmentHistory.reversed().forEachIndexed { index, check ->
-            Card(
-              modifier = Modifier
-                .fillMaxWidth()
-                .padding(vertical = 6.dp)
-                .widthIn(max = 500.dp),
-              colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.surface
-              ),
-              shape = RoundedCornerShape(12.dp)
-            ) {
-              Column(modifier = Modifier.padding(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  Text(
-                    text = "Check #${reassessmentHistory.size - index}",
-                    fontWeight = FontWeight.Black,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.primary
-                  )
-                  Spacer(modifier = Modifier.weight(1f))
-                  Text(
-                    text = check.estimatedLevel,
-                    fontWeight = FontWeight.Black,
-                    fontSize = 14.sp,
-                    color = Color(0xFFF59E0B)
-                  )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = check.estimatedLevelDescription,
-                  fontSize = 12.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface
-                )
-                Spacer(modifier = Modifier.height(8.dp))
-                DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f), thickness = 1.dp)
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                  text = "🚀 WHAT IMPROVED:",
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 11.sp,
-                  color = Color(0xFF10B981)
-                )
-                Text(
-                  text = check.whatImproved,
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                  text = "⚠️ WHAT STAYED WEAK:",
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 11.sp,
-                  color = Color(0xFFEF4444)
-                )
-                Text(
-                  text = check.whatStayedWeak,
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
-                )
-                Spacer(modifier = Modifier.height(6.dp))
-                Text(
-                  text = "💡 NEXT WEEK FOCUS:",
-                  fontWeight = FontWeight.Bold,
-                  fontSize = 11.sp,
-                  color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                  text = check.focusNextWeek,
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
-                )
-              }
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Headline
-        Text(
-          text = "Your Personalized 7-Day Practice",
-          style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-          color = MaterialTheme.colorScheme.onBackground,
-          textAlign = TextAlign.Start,
-          modifier = Modifier.fillMaxWidth()
-        )
-        Text(
-          text = "Immerse in local real-life scenarios calibrated for ${onboardingData.city}.",
-          fontSize = 12.sp,
-          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
-          textAlign = TextAlign.Start,
-          modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp)
-        )
-
-        // Render each of the 7 days task cards as friendly mission cards
-        dayTasks.forEach { task ->
-          val isCompleted = completedDays.contains(task.day)
-          val isCurrentActive = !isCompleted && completedDays.size == task.day - 1
-
-          val (difficulty, diffColor, estTime) = when (task.day) {
-            1 -> Triple("Easy", Color(0xFF10B981), "4 mins")
-            2 -> Triple("Medium", Color(0xFFF59E0B), "5 mins")
-            3 -> Triple("Medium", Color(0xFFF59E0B), "6 mins")
-            4 -> Triple("Easy", Color(0xFF10B981), "3 mins")
-            5 -> Triple("Medium", Color(0xFFF59E0B), "5 mins")
-            6 -> Triple("Medium", Color(0xFFF59E0B), "5 mins")
-            7 -> Triple("Challenge", Color(0xFFEF4444), "8 mins")
-            else -> Triple("Medium", Color(0xFFF59E0B), "5 mins")
-          }
-
-          Card(
-            modifier = Modifier
-              .fillMaxWidth()
-              .padding(vertical = 10.dp)
-              .widthIn(max = 500.dp)
-              .testTag("day_plan_card_${task.day}")
-              .shadow(if (isCurrentActive) 8.dp else 4.dp, RoundedCornerShape(20.dp))
-              .border(
-                width = if (isCurrentActive) 2.dp else 1.dp,
-                color = when {
-                  isCompleted -> Color(0xFF10B981).copy(alpha = 0.4f)
-                  isCurrentActive -> Color(0xFF14B8A6)
-                  else -> Color(0xFFE2E8F0)
-                },
-                shape = RoundedCornerShape(20.dp)
-              ),
-            colors = CardDefaults.cardColors(
-              containerColor = when {
-                isCompleted -> Color(0xFFF0FDF4)
-                isCurrentActive -> Color(0xFFF0FDFA)
-                else -> Color.White
-              }
-            ),
-            shape = RoundedCornerShape(20.dp)
-          ) {
-            Column(
-              modifier = Modifier.padding(20.dp)
-            ) {
-              // Top Row: Day Number, Icon, Difficulty & Time Badge
-              Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-              ) {
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(
-                      when {
-                        isCompleted -> Color(0xFF10B981).copy(alpha = 0.15f)
-                        isCurrentActive -> Color(0xFF14B8A6).copy(alpha = 0.15f)
-                        else -> Color(0xFFE6F4EA)
-                      }
-                    )
-                    .padding(horizontal = 8.dp, vertical = 4.dp)
-                ) {
-                  Text(
-                    text = if (isCurrentActive) "Today's mission" else "Mission ${task.day}",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (isCompleted) Color(0xFF059669) else Color(0xFF14B8A6)
-                  )
-                }
-                
-                Spacer(modifier = Modifier.width(8.dp))
-                
-                Text(
-                  text = task.icon,
-                  fontSize = 20.sp
-                )
-
-                Spacer(modifier = Modifier.weight(1f))
-                
-                // Difficulty Badge
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(diffColor.copy(alpha = 0.1f))
-                    .padding(horizontal = 6.dp, vertical = 3.dp)
-                ) {
-                  Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(4.dp)
-                  ) {
-                    Box(
-                      modifier = Modifier
-                        .size(6.dp)
-                        .background(diffColor, CircleShape)
-                    )
-                    Text(
-                      text = difficulty,
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.Bold,
-                      color = diffColor
-                    )
-                  }
-                }
-
-                Spacer(modifier = Modifier.width(8.dp))
-
-                // Time Badge
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(6.dp))
-                    .background(if (isCompleted) Color(0xFFDCFCE7) else Color(0xFFF1F5F9))
-                    .padding(horizontal = 6.dp, vertical = 3.dp)
-                ) {
-                  Text(
-                    text = "⏱️ $estTime",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = if (isCompleted) Color(0xFF15803D) else Color(0xFF475569)
-                  )
-                }
-              }
-
-              Spacer(modifier = Modifier.height(12.dp))
-
-              // Scenario Title
-              Text(
-                text = task.title,
-                style = MaterialTheme.typography.titleMedium.copy(
-                  fontWeight = FontWeight.ExtraBold,
-                  letterSpacing = (-0.5).sp
-                ),
-                color = Color(0xFF0F172A)
-              )
-
-              Spacer(modifier = Modifier.height(10.dp))
-
-              // Mission Details Brief Section
-              Column(
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .clip(RoundedCornerShape(12.dp))
-                  .background(if (isCompleted) Color(0xFFF8FAF7) else Color(0xFFF8FAFC))
-                  .padding(12.dp)
-              ) {
-                Row(
-                  verticalAlignment = Alignment.Top
-                ) {
-                  Text(
-                    text = "📍",
-                    fontSize = 14.sp,
-                    modifier = Modifier.padding(top = 2.dp)
-                  )
-                  Spacer(modifier = Modifier.width(8.dp))
-                  Column {
-                    Text(
-                      text = "WHERE",
-                      style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF64748B)
-                      )
-                    )
-                    Text(
-                      text = task.situation,
-                      style = MaterialTheme.typography.bodyMedium,
-                      color = Color(0xFF334155)
-                    )
-                  }
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                Row(
-                  verticalAlignment = Alignment.Top
-                ) {
-                  Text(
-                    text = "🎯",
-                    fontSize = 14.sp,
-                    modifier = Modifier.padding(top = 2.dp)
-                  )
-                  Spacer(modifier = Modifier.width(8.dp))
-                  Column {
-                    Text(
-                      text = "MISSION GOAL",
-                      style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF64748B)
-                      )
-                    )
-                    Text(
-                      text = task.practiceGoal,
-                      style = MaterialTheme.typography.bodyMedium,
-                      color = Color(0xFF334155)
-                    )
-                  }
-                }
-              }
-
-              Spacer(modifier = Modifier.height(16.dp))
-
-              // Launcher Action Button
-              Button(
-                onClick = { onStartPractice(task) },
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .height(48.dp)
-                  .testTag("start_practice_day_${task.day}"),
-                shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(
-                  containerColor = if (isCompleted) Color(0xFFE2E8F0) else Color(0xFF14B8A6),
-                  contentColor = if (isCompleted) Color(0xFF475569) else Color.White
-                )
-              ) {
-                Row(
-                  verticalAlignment = Alignment.CenterVertically,
-                  horizontalArrangement = Arrangement.Center
-                ) {
-                  Icon(
-                    imageVector = if (isCompleted) Icons.Default.CheckCircle else Icons.Default.PlayArrow,
-                    contentDescription = null,
-                    modifier = Modifier.size(18.dp)
-                  )
-                  Spacer(modifier = Modifier.width(8.dp))
-                  Text(
-                    text = if (isCompleted) "Re-play Mission" else "Launch Mission",
-                    style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold)
-                  )
-                }
-              }
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(48.dp))
+        Text("Start Practice", fontSize = 18.sp, fontWeight = FontWeight.Bold)
+      }
+      
+      Spacer(modifier = Modifier.height(16.dp))
+      
+      OutlinedButton(
+        onClick = onViewProgress,
+        modifier = Modifier
+          .fillMaxWidth()
+          .height(56.dp),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary)
+      ) {
+        Text("View Progress", fontSize = 16.sp, fontWeight = FontWeight.Medium)
+      }
+      
+      Spacer(modifier = Modifier.height(16.dp))
+      
+      TextButton(
+        onClick = onOpenSettings,
+        modifier = Modifier.fillMaxWidth()
+      ) {
+        Text("Change Goal", fontSize = 14.sp, color = MaterialTheme.colorScheme.secondary)
       }
     }
   }
@@ -2840,28 +2860,28 @@ fun GamificationStatsBar(
       title = "Streak",
       value = "$streakCount Days",
       icon = "🔥",
-      tint = Color(0xFFF97316),
+      tint = MaterialTheme.colorScheme.secondary,
       modifier = Modifier.weight(1f)
     )
     GamificationStatCard(
       title = "Practice",
       value = "$practiceMinutes Mins",
       icon = "⏳",
-      tint = Color(0xFF14B8A6),
+      tint = MaterialTheme.colorScheme.primary,
       modifier = Modifier.weight(1f)
     )
     GamificationStatCard(
       title = "Missions",
       value = "$completedMissions/7",
       icon = "🎯",
-      tint = Color(0xFF3B82F6),
+      tint = MaterialTheme.colorScheme.primary,
       modifier = Modifier.weight(1f)
     )
     GamificationStatCard(
       title = "Level",
       value = levelBadge,
       icon = "🎖️",
-      tint = Color(0xFF8B5CF6),
+      tint = MaterialTheme.colorScheme.primary,
       modifier = Modifier.weight(1f)
     )
   }
@@ -2879,7 +2899,7 @@ fun GamificationStatCard(
     modifier = modifier
       .shadow(1.dp, RoundedCornerShape(12.dp)),
     shape = RoundedCornerShape(12.dp),
-    colors = CardDefaults.cardColors(containerColor = Color.White)
+    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
   ) {
     Column(
       modifier = Modifier
@@ -2902,15 +2922,14 @@ fun GamificationStatCard(
         text = title.uppercase(),
         fontSize = 8.sp,
         fontWeight = FontWeight.ExtraBold,
-        color = Color(0xFF64748B),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
         letterSpacing = 0.5.sp
       )
       Spacer(modifier = Modifier.height(2.dp))
       Text(
         text = value,
         fontSize = 11.sp,
-        fontWeight = FontWeight.Black,
-        color = Color(0xFF1E293B),
+        fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.onSurface,
         textAlign = TextAlign.Center,
         maxLines = 1,
         overflow = TextOverflow.Ellipsis
@@ -2933,11 +2952,11 @@ fun CelebrationDialog(
     confirmButton = {
       Button(
         onClick = onDismiss,
-        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF14B8A6)),
+        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
         shape = RoundedCornerShape(20.dp),
         modifier = Modifier.fillMaxWidth().height(44.dp)
       ) {
-        Text("Cheers! Let's Keep It Up 🚀", fontWeight = FontWeight.Bold, color = Color.White)
+        Text("Cheers! Let's Keep It Up 🚀", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
       }
     },
     title = {
@@ -2949,7 +2968,7 @@ fun CelebrationDialog(
           modifier = Modifier
             .size(56.dp)
             .clip(CircleShape)
-            .background(Color(0xFFE0F2FE)),
+            .background(MaterialTheme.colorScheme.primaryContainer),
           contentAlignment = Alignment.Center
         ) {
           Text("🎉", fontSize = 28.sp)
@@ -2961,14 +2980,14 @@ fun CelebrationDialog(
             fontWeight = FontWeight.Black,
             letterSpacing = 0.5.sp
           ),
-          color = Color(0xFF0F172A),
+          color = MaterialTheme.colorScheme.onSurface,
           textAlign = TextAlign.Center
         )
         Text(
           text = "Linguistic Coaching Review",
           fontSize = 11.sp,
           fontWeight = FontWeight.Medium,
-          color = Color(0xFF0284C7),
+          color = MaterialTheme.colorScheme.primary,
           textAlign = TextAlign.Center
         )
       }
@@ -2982,7 +3001,7 @@ fun CelebrationDialog(
           text = "Top-tier effort! Your native British speaking skills have leveled up today. You're building robust daily practice habits and authentic fluency.",
           fontSize = 13.sp,
           fontWeight = FontWeight.Normal,
-          color = Color(0xFF475569),
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
           textAlign = TextAlign.Center,
           lineHeight = 18.sp
         )
@@ -2996,25 +3015,25 @@ fun CelebrationDialog(
             label = "STREAK",
             value = "$streakCount Days",
             subtext = "+1 Day 🔥",
-            color = Color(0xFFF97316)
+            color = MaterialTheme.colorScheme.secondary
           )
           CelebrationMetricBox(
             label = "PRACTICE TIME",
             value = "$totalPracticeMinutes m",
             subtext = "+$practiceMinutesGained m ⏳",
-            color = Color(0xFF14B8A6)
+            color = MaterialTheme.colorScheme.primary
           )
           CelebrationMetricBox(
             label = "LEVEL",
             value = levelBadge,
             subtext = "Active Progress 🎖️",
-            color = Color(0xFF8B5CF6)
+            color = MaterialTheme.colorScheme.primary
           )
         }
       }
     },
     shape = RoundedCornerShape(20.dp),
-    containerColor = Color.White
+    containerColor = MaterialTheme.colorScheme.surface
   )
 }
 
@@ -3038,14 +3057,13 @@ fun CelebrationMetricBox(
       text = label,
       fontSize = 8.sp,
       fontWeight = FontWeight.ExtraBold,
-      color = Color(0xFF64748B)
+      color = MaterialTheme.colorScheme.onSurfaceVariant
     )
     Spacer(modifier = Modifier.height(2.dp))
     Text(
       text = value,
       fontSize = 11.sp,
-      fontWeight = FontWeight.Black,
-      color = Color(0xFF1E293B)
+      fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.onSurface
     )
     Spacer(modifier = Modifier.height(2.dp))
     Text(
@@ -3387,14 +3405,14 @@ fun PracticeProgressStepper(currentStep: Int) {
       val isCompleted = stepNum < currentStep
       val isActive = stepNum == currentStep
       val textColor = when {
-        isCompleted -> Color(0xFF14B8A6)
-        isActive -> Color(0xFF2563EB)
-        else -> Color(0xFF64748B)
+        isCompleted -> MaterialTheme.colorScheme.primary
+        isActive -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
       }
       val barColor = when {
-        isCompleted -> Color(0xFF14B8A6)
-        isActive -> Color(0xFF2563EB)
-        else -> Color(0xFFCBD5E1).copy(alpha = 0.5f)
+        isCompleted -> MaterialTheme.colorScheme.primary
+        isActive -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
       }
       
       Column(
@@ -3554,7 +3572,7 @@ fun FluentCityPracticeChatScreen(
         Box(
           modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF0F172A))
+            .background(MaterialTheme.colorScheme.background)
             .padding(
               top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
               bottom = 12.dp,
@@ -3567,13 +3585,13 @@ fun FluentCityPracticeChatScreen(
             modifier = Modifier.fillMaxWidth()
           ) {
             IconButton(onClick = onBack) {
-              Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+              Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = MaterialTheme.colorScheme.onSurface)
             }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
               text = "Learn: Useful Phrases 🇬🇧",
               style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-              color = Color.White
+              color = MaterialTheme.colorScheme.onSurface
             )
           }
         }
@@ -3582,7 +3600,7 @@ fun FluentCityPracticeChatScreen(
       Column(
         modifier = Modifier
           .fillMaxSize()
-          .background(Color(0xFFF8FAFC))
+          .background(MaterialTheme.colorScheme.background)
           .padding(paddingValues)
           .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -3593,7 +3611,7 @@ fun FluentCityPracticeChatScreen(
         
         Card(
           shape = RoundedCornerShape(16.dp),
-          colors = CardDefaults.cardColors(containerColor = Color.White),
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
           modifier = Modifier.fillMaxWidth().shadow(1.dp, RoundedCornerShape(16.dp))
         ) {
           Column(modifier = Modifier.padding(16.dp)) {
@@ -3601,13 +3619,13 @@ fun FluentCityPracticeChatScreen(
               text = "Prepare Your Conversation",
               fontSize = 16.sp,
               fontWeight = FontWeight.ExtraBold,
-              color = Color(0xFF0F172A)
+              color = MaterialTheme.colorScheme.onSurface
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
               text = "Here are three highly natural local phrases curated for this scenario. Observe their structure and try to speak or formulate them when you start conversational practice.",
               fontSize = 12.sp,
-              color = Color(0xFF64748B),
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
               lineHeight = 16.sp
             )
           }
@@ -3622,17 +3640,17 @@ fun FluentCityPracticeChatScreen(
           // 1. One clear learning goal
           Card(
             shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
             modifier = Modifier
               .fillMaxWidth()
-              .border(1.dp, Color(0xFFBFDBFE), RoundedCornerShape(14.dp))
+              .border(1.dp, MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(14.dp))
           ) {
             Column(modifier = Modifier.padding(16.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                   imageVector = Icons.Default.Star,
                   contentDescription = "Learning Goal",
-                  tint = Color(0xFF2563EB),
+                  tint = MaterialTheme.colorScheme.primary,
                   modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -3640,14 +3658,14 @@ fun FluentCityPracticeChatScreen(
                   text = "Clear Learning Goal",
                   fontSize = 14.sp,
                   fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF1E40AF)
+                  color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
               }
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = learningMaterials.learningGoal,
                 fontSize = 12.sp,
-                color = Color(0xFF1E3A8A),
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
                 lineHeight = 16.sp
               )
             }
@@ -3659,17 +3677,17 @@ fun FluentCityPracticeChatScreen(
               text = "Three Key Local Phrases:",
               fontSize = 13.sp,
               fontWeight = FontWeight.Bold,
-              color = Color(0xFF334155),
+              color = MaterialTheme.colorScheme.outline,
               modifier = Modifier.padding(horizontal = 4.dp)
             )
 
             learningMaterials.usefulPhrases.forEachIndexed { index, (phrase, explanation) ->
               Card(
                 shape = RoundedCornerShape(14.dp),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
                 modifier = Modifier
                   .fillMaxWidth()
-                  .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(14.dp))
+                  .border(1.dp, MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(14.dp))
               ) {
                 Row(
                   modifier = Modifier.padding(14.dp),
@@ -3680,14 +3698,14 @@ fun FluentCityPracticeChatScreen(
                     modifier = Modifier
                       .size(28.dp)
                       .clip(CircleShape)
-                      .background(Color(0xFFE0F2FE)),
+                      .background(MaterialTheme.colorScheme.primaryContainer),
                     contentAlignment = Alignment.Center
                   ) {
                     Text(
                       text = (index + 1).toString(),
                       fontSize = 13.sp,
                       fontWeight = FontWeight.ExtraBold,
-                      color = Color(0xFF0284C7)
+                      color = MaterialTheme.colorScheme.primary
                     )
                   }
                   
@@ -3696,14 +3714,14 @@ fun FluentCityPracticeChatScreen(
                       text = phrase,
                       fontSize = 14.sp,
                       fontWeight = FontWeight.ExtraBold,
-                      color = Color(0xFF0F172A),
+                      color = MaterialTheme.colorScheme.onSurface,
                       lineHeight = 18.sp
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                       text = explanation,
                       fontSize = 12.sp,
-                      color = Color(0xFF475569),
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                       lineHeight = 16.sp
                     )
                   }
@@ -3715,17 +3733,17 @@ fun FluentCityPracticeChatScreen(
           // 3. One short explanation
           Card(
             shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBEB)),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
             modifier = Modifier
               .fillMaxWidth()
-              .border(1.dp, Color(0xFFFDE68A), RoundedCornerShape(14.dp))
+              .border(1.dp, MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(14.dp))
           ) {
             Column(modifier = Modifier.padding(16.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                   imageVector = Icons.Default.Info,
                   contentDescription = "Explanation",
-                  tint = Color(0xFFD97706),
+                  tint = MaterialTheme.colorScheme.secondary,
                   modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -3733,14 +3751,14 @@ fun FluentCityPracticeChatScreen(
                   text = "Linguistic Explanation",
                   fontSize = 14.sp,
                   fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF92400E)
+                  color = MaterialTheme.colorScheme.onSecondaryContainer
                 )
               }
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = learningMaterials.shortExplanation,
                 fontSize = 12.sp,
-                color = Color(0xFF78350F),
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
                 lineHeight = 16.sp
               )
             }
@@ -3749,17 +3767,17 @@ fun FluentCityPracticeChatScreen(
           // 4. One practice task
           Card(
             shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFECFDF5)),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
             modifier = Modifier
               .fillMaxWidth()
-              .border(1.dp, Color(0xFFA7F3D0), RoundedCornerShape(14.dp))
+              .border(1.dp, MaterialTheme.colorScheme.tertiaryContainer, RoundedCornerShape(14.dp))
           ) {
             Column(modifier = Modifier.padding(16.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                   imageVector = Icons.Default.PlayArrow,
                   contentDescription = "Practice Task",
-                  tint = Color(0xFF059669),
+                  tint = MaterialTheme.colorScheme.tertiary,
                   modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -3767,14 +3785,14 @@ fun FluentCityPracticeChatScreen(
                   text = "Active Practice Task",
                   fontSize = 14.sp,
                   fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF065F46)
+                  color = MaterialTheme.colorScheme.onTertiaryContainer
                 )
               }
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = learningMaterials.practiceTask,
                 fontSize = 12.sp,
-                color = Color(0xFF047857),
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
                 lineHeight = 16.sp
               )
             }
@@ -3783,17 +3801,17 @@ fun FluentCityPracticeChatScreen(
           // 5. One correction task
           Card(
             shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFFDF2F8)),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
             modifier = Modifier
               .fillMaxWidth()
-              .border(1.dp, Color(0xFFFBCFE8), RoundedCornerShape(14.dp))
+              .border(1.dp, MaterialTheme.colorScheme.secondaryContainer, RoundedCornerShape(14.dp))
           ) {
             Column(modifier = Modifier.padding(16.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                   imageVector = Icons.Default.CheckCircle,
                   contentDescription = "Correction Challenge",
-                  tint = Color(0xFFDB2777),
+                  tint = MaterialTheme.colorScheme.secondary,
                   modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -3801,14 +3819,14 @@ fun FluentCityPracticeChatScreen(
                   text = "Mistake Correction Challenge",
                   fontSize = 14.sp,
                   fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF9D174D)
+                  color = MaterialTheme.colorScheme.onSecondaryContainer
                 )
               }
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = learningMaterials.correctionTask,
                 fontSize = 12.sp,
-                color = Color(0xFF831843),
+                color = MaterialTheme.colorScheme.onSecondaryContainer,
                 lineHeight = 16.sp
               )
             }
@@ -3817,17 +3835,17 @@ fun FluentCityPracticeChatScreen(
           // 6. One review item from previous mistakes
           Card(
             shape = RoundedCornerShape(14.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFF5F3FF)),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
             modifier = Modifier
               .fillMaxWidth()
-              .border(1.dp, Color(0xFFDDD6FE), RoundedCornerShape(14.dp))
+              .border(1.dp, MaterialTheme.colorScheme.primaryContainer, RoundedCornerShape(14.dp))
           ) {
             Column(modifier = Modifier.padding(16.dp)) {
               Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
                   imageVector = Icons.Default.Refresh,
                   contentDescription = "Review Item",
-                  tint = Color(0xFF7C3AED),
+                  tint = MaterialTheme.colorScheme.primary,
                   modifier = Modifier.size(20.dp)
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -3835,14 +3853,14 @@ fun FluentCityPracticeChatScreen(
                   text = "Personalized Review Item",
                   fontSize = 14.sp,
                   fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF5B21B6)
+                  color = MaterialTheme.colorScheme.onPrimaryContainer
                 )
               }
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = learningMaterials.reviewItemFromPreviousMistakes,
                 fontSize = 12.sp,
-                color = Color(0xFF4C1D95),
+                color = MaterialTheme.colorScheme.onPrimaryContainer,
                 lineHeight = 16.sp
               )
             }
@@ -3854,7 +3872,7 @@ fun FluentCityPracticeChatScreen(
         Button(
           onClick = { currentStep = 2 },
           shape = RoundedCornerShape(26.dp),
-          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF14B8A6)),
+          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
           modifier = Modifier
             .fillMaxWidth()
             .height(52.dp)
@@ -3864,8 +3882,8 @@ fun FluentCityPracticeChatScreen(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
           ) {
-            Text("I'm Ready to Practise! 💬", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
-            Icon(imageVector = Icons.Default.ArrowForward, contentDescription = "Next")
+            Text("I'm Ready to Practise! 💬", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = MaterialTheme.colorScheme.onSurface)
+            Icon(imageVector = Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Next")
           }
         }
       }
@@ -3887,7 +3905,7 @@ fun FluentCityPracticeChatScreen(
         Box(
           modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF0F172A))
+            .background(MaterialTheme.colorScheme.background)
             .padding(
               top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
               bottom = 12.dp,
@@ -3900,13 +3918,13 @@ fun FluentCityPracticeChatScreen(
             modifier = Modifier.fillMaxWidth()
           ) {
             IconButton(onClick = { currentStep = 3 }) {
-              Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+              Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back", tint = MaterialTheme.colorScheme.onSurface)
             }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
               text = "Real-Life Challenge 🏆",
               style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-              color = Color.White
+              color = MaterialTheme.colorScheme.onSurface
             )
           }
         }
@@ -3915,7 +3933,7 @@ fun FluentCityPracticeChatScreen(
       Column(
         modifier = Modifier
           .fillMaxSize()
-          .background(Color(0xFFF8FAFC))
+          .background(MaterialTheme.colorScheme.background)
           .padding(paddingValues)
           .padding(16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -3928,7 +3946,7 @@ fun FluentCityPracticeChatScreen(
           modifier = Modifier
             .size(72.dp)
             .clip(CircleShape)
-            .background(Color(0xFFD1FAE5)),
+            .background(MaterialTheme.colorScheme.tertiaryContainer),
           contentAlignment = Alignment.Center
         ) {
           Text("🏅", fontSize = 38.sp)
@@ -3940,7 +3958,7 @@ fun FluentCityPracticeChatScreen(
           text = "Challenge Unlocked!",
           fontSize = 20.sp,
           fontWeight = FontWeight.Black,
-          color = Color(0xFF065F46)
+          color = MaterialTheme.colorScheme.onTertiaryContainer
         )
         
         Spacer(modifier = Modifier.height(8.dp))
@@ -3948,7 +3966,7 @@ fun FluentCityPracticeChatScreen(
         Text(
           text = "To truly cement your new Southern British phrasing habits, take this session out of the app and try it in real-world environments:",
           fontSize = 13.sp,
-          color = Color(0xFF475569),
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
           textAlign = TextAlign.Center,
           lineHeight = 18.sp,
           modifier = Modifier.padding(horizontal = 8.dp)
@@ -3958,12 +3976,12 @@ fun FluentCityPracticeChatScreen(
         
         Card(
           shape = RoundedCornerShape(16.dp),
-          colors = CardDefaults.cardColors(containerColor = Color.White),
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
           modifier = Modifier
             .fillMaxWidth()
             .weight(1f)
             .shadow(2.dp, RoundedCornerShape(16.dp))
-            .border(1.dp, Color(0xFF10B981).copy(alpha = 0.25f), RoundedCornerShape(16.dp))
+            .border(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.25f), RoundedCornerShape(16.dp))
         ) {
           Column(
             modifier = Modifier.padding(20.dp),
@@ -3974,7 +3992,7 @@ fun FluentCityPracticeChatScreen(
               modifier = Modifier
                 .size(42.dp)
                 .clip(CircleShape)
-                .background(Color(0xFFEFF6FF)),
+                .background(MaterialTheme.colorScheme.primaryContainer),
               contentAlignment = Alignment.Center
             ) {
               Text("🎯", fontSize = 20.sp)
@@ -3986,7 +4004,7 @@ fun FluentCityPracticeChatScreen(
               text = "YOUR REAL-LIFE ACTION PLAN",
               fontSize = 11.sp,
               fontWeight = FontWeight.ExtraBold,
-              color = Color(0xFF2563EB),
+              color = MaterialTheme.colorScheme.primary,
               letterSpacing = 1.sp
             )
             
@@ -3995,8 +4013,7 @@ fun FluentCityPracticeChatScreen(
             Text(
               text = learningMaterials.realLifeChallenge,
               fontSize = 14.sp,
-              fontWeight = FontWeight.Bold,
-              color = Color(0xFF1E293B),
+              fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface,
               textAlign = TextAlign.Center,
               lineHeight = 20.sp
             )
@@ -4007,7 +4024,7 @@ fun FluentCityPracticeChatScreen(
               modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(8.dp))
-                .background(Color(0xFFECFDF5))
+                .background(MaterialTheme.colorScheme.tertiaryContainer)
                 .padding(12.dp),
               horizontalArrangement = Arrangement.spacedBy(8.dp),
               verticalAlignment = Alignment.CenterVertically
@@ -4015,14 +4032,14 @@ fun FluentCityPracticeChatScreen(
               Icon(
                 imageVector = Icons.Default.CheckCircle,
                 contentDescription = "Tip",
-                tint = Color(0xFF10B981),
+                tint = MaterialTheme.colorScheme.tertiary,
                 modifier = Modifier.size(20.dp)
               )
               Text(
                 text = "Active coaching tip: Speaking with locals builds fast subconscious reflex connections!",
                 fontSize = 11.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF045F43),
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
                 modifier = Modifier.weight(1f)
               )
             }
@@ -4034,7 +4051,7 @@ fun FluentCityPracticeChatScreen(
         Button(
           onClick = { currentStep = 5 },
           shape = RoundedCornerShape(26.dp),
-          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF14B8A6)),
+          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
           modifier = Modifier
             .fillMaxWidth()
             .height(52.dp)
@@ -4044,7 +4061,7 @@ fun FluentCityPracticeChatScreen(
             text = "Complete Mission & Apply 🚀",
             fontWeight = FontWeight.Bold,
             fontSize = 15.sp,
-            color = Color.White
+            color = MaterialTheme.colorScheme.onSurface
           )
         }
       }
@@ -4065,7 +4082,7 @@ fun FluentCityPracticeChatScreen(
         Box(
           modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF0F172A))
+            .background(MaterialTheme.colorScheme.background)
             .padding(
               top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
               bottom = 12.dp,
@@ -4078,13 +4095,13 @@ fun FluentCityPracticeChatScreen(
             modifier = Modifier.fillMaxWidth()
           ) {
             IconButton(onClick = { currentStep = 4 }) {
-              Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back to Challenge", tint = Color.White)
+              Icon(imageVector = Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back to Challenge", tint = MaterialTheme.colorScheme.onSurface)
             }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
               text = "Conversation Feedback Check-In 📊",
               style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-              color = Color.White
+              color = MaterialTheme.colorScheme.onSurface
             )
           }
         }
@@ -4093,7 +4110,7 @@ fun FluentCityPracticeChatScreen(
       Column(
         modifier = Modifier
           .fillMaxSize()
-          .background(Color(0xFFF8FAFC))
+          .background(MaterialTheme.colorScheme.background)
           .padding(paddingValues)
           .padding(16.dp)
           .verticalScroll(rememberScrollState()),
@@ -4101,25 +4118,25 @@ fun FluentCityPracticeChatScreen(
       ) {
         Card(
           shape = RoundedCornerShape(16.dp),
-          colors = CardDefaults.cardColors(containerColor = Color.White),
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
           modifier = Modifier
             .fillMaxWidth()
             .shadow(1.dp, RoundedCornerShape(16.dp))
-            .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(16.dp))
+            .border(1.dp, MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(16.dp))
         ) {
           Column(modifier = Modifier.padding(18.dp)) {
             Text(
               text = "CONVERSATION CONFIDENCE CHECK 🧠",
               fontSize = 11.sp,
               fontWeight = FontWeight.ExtraBold,
-              color = Color(0xFF0EA5E9),
+              color = MaterialTheme.colorScheme.primary,
               letterSpacing = 0.5.sp
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
               text = "Reflecting on your confidence levels allows us to tailor upcoming speaking repetitions, severe corrections, or pacing dynamically.",
               fontSize = 12.sp,
-              color = Color(0xFF64748B),
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
               lineHeight = 16.sp
             )
           }
@@ -4129,11 +4146,11 @@ fun FluentCityPracticeChatScreen(
 
         Card(
           shape = RoundedCornerShape(20.dp),
-          colors = CardDefaults.cardColors(containerColor = Color.White),
+          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
           modifier = Modifier
             .fillMaxWidth()
             .shadow(2.dp, RoundedCornerShape(20.dp))
-            .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(20.dp))
+            .border(1.dp, MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(20.dp))
         ) {
           Column(
             modifier = Modifier.padding(20.dp),
@@ -4143,7 +4160,7 @@ fun FluentCityPracticeChatScreen(
               modifier = Modifier
                 .size(64.dp)
                 .clip(CircleShape)
-                .background(Color(0xFFF0F9FF)),
+                .background(MaterialTheme.colorScheme.primaryContainer),
               contentAlignment = Alignment.Center
             ) {
               Text("💭", fontSize = 32.sp)
@@ -4155,7 +4172,7 @@ fun FluentCityPracticeChatScreen(
               text = "How confident did you feel in this conversation?",
               fontSize = 16.sp,
               fontWeight = FontWeight.ExtraBold,
-              color = Color(0xFF0F172A),
+              color = MaterialTheme.colorScheme.onSurface,
               textAlign = TextAlign.Center,
               lineHeight = 22.sp
             )
@@ -4168,9 +4185,9 @@ fun FluentCityPracticeChatScreen(
             ) {
               confidenceOptions.forEach { (optionName, emoji) ->
                 val isSelected = selectedConfidenceOption == optionName
-                val borderStrokeColor = if (isSelected) Color(0xFF0284C7) else Color(0xFFE2E8F0)
-                val backgroundContainerColor = if (isSelected) Color(0xFFF0F9FF) else Color.White
-                val textColor = if (isSelected) Color(0xFF0369A1) else Color(0xFF334155)
+                val borderStrokeColor = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surfaceVariant
+                val backgroundContainerColor = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
+                val textColor = if (isSelected) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.outline
                 val tagWord = optionName.lowercase().replace(" ", "_")
 
                 Row(
@@ -4202,13 +4219,13 @@ fun FluentCityPracticeChatScreen(
                       modifier = Modifier
                         .size(16.dp)
                         .clip(CircleShape)
-                        .background(Color(0xFF0284C7)),
+                        .background(MaterialTheme.colorScheme.primary),
                       contentAlignment = Alignment.Center
                     ) {
                       Icon(
                         imageVector = Icons.Default.Check,
                         contentDescription = "Selected",
-                        tint = Color.White,
+                        tint = MaterialTheme.colorScheme.onSurface,
                         modifier = Modifier.size(10.dp)
                       )
                     }
@@ -4231,7 +4248,7 @@ fun FluentCityPracticeChatScreen(
             )
           },
           shape = RoundedCornerShape(26.dp),
-          colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF14B8A6)),
+          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
           modifier = Modifier
             .fillMaxWidth()
             .height(52.dp)
@@ -4242,7 +4259,7 @@ fun FluentCityPracticeChatScreen(
             text = "Save & Finish Mission 🚀",
             fontWeight = FontWeight.Bold,
             fontSize = 15.sp,
-            color = Color.White
+            color = MaterialTheme.colorScheme.onSurface
           )
         }
       }
@@ -4254,7 +4271,7 @@ fun FluentCityPracticeChatScreen(
         Box(
           modifier = Modifier
             .fillMaxWidth()
-            .background(Color(0xFF0F172A))
+            .background(MaterialTheme.colorScheme.background)
             .padding(
               top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
               bottom = 12.dp,
@@ -4271,9 +4288,9 @@ fun FluentCityPracticeChatScreen(
               modifier = Modifier.testTag("chat_back_button")
             ) {
               Icon(
-                imageVector = Icons.Default.ArrowBack,
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                 contentDescription = "Back to dashboard",
-                tint = Color.White
+                tint = MaterialTheme.colorScheme.onSurface
               )
             }
             
@@ -4284,15 +4301,15 @@ fun FluentCityPracticeChatScreen(
               modifier = Modifier
                 .size(42.dp)
                 .clip(CircleShape)
-                .background(Color(0xFF0F172A))
-                .border(1.5.dp, Color(0xFF14B8A6), CircleShape),
+                .background(MaterialTheme.colorScheme.background)
+                .border(1.5.dp, MaterialTheme.colorScheme.primary, CircleShape),
               contentAlignment = Alignment.Center
             ) {
               Box(
                 modifier = Modifier
                   .size(36.dp)
                   .clip(CircleShape)
-                  .background(Color(0xFF1E293B)),
+                  .background(MaterialTheme.colorScheme.surface),
                 contentAlignment = Alignment.Center
               ) {
                 Text(
@@ -4312,7 +4329,7 @@ fun FluentCityPracticeChatScreen(
                     fontWeight = FontWeight.Bold,
                     letterSpacing = (-0.3).sp
                   ),
-                  color = Color.White,
+                  color = MaterialTheme.colorScheme.onSurface,
                   maxLines = 1,
                   overflow = TextOverflow.Ellipsis
                 )
@@ -4321,14 +4338,14 @@ fun FluentCityPracticeChatScreen(
                 Box(
                   modifier = Modifier
                     .size(8.dp)
-                    .background(Color(0xFF10B981), CircleShape)
+                    .background(MaterialTheme.colorScheme.tertiary, CircleShape)
                 )
               }
               // Scenario Title at the top
               Text(
                 text = "Mission: " + task.title,
                 style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-                color = Color(0xFF14B8A6),
+                color = MaterialTheme.colorScheme.primary,
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
               )
@@ -4341,7 +4358,7 @@ fun FluentCityPracticeChatScreen(
                 isLoadingFeedback = true
               },
               colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF14B8A6)
+                containerColor = MaterialTheme.colorScheme.primary
               ),
               contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
               shape = RoundedCornerShape(12.dp),
@@ -4358,7 +4375,7 @@ fun FluentCityPracticeChatScreen(
                   text = "Finish Practice 🏁",
                   fontSize = 11.sp,
                   fontWeight = FontWeight.Bold,
-                  color = Color.White
+                  color = MaterialTheme.colorScheme.onSurface
                 )
               }
             }
@@ -4381,7 +4398,7 @@ fun FluentCityPracticeChatScreen(
           .testTag("collapsible_scenario_card"),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
-          containerColor = Color(0xFFF1F5F9)
+          containerColor = MaterialTheme.colorScheme.surfaceVariant
         ),
         onClick = { scenarioExpanded = !scenarioExpanded }
       ) {
@@ -4391,14 +4408,14 @@ fun FluentCityPracticeChatScreen(
               text = "📌 Active Mission Scenario",
               fontSize = 12.sp,
               fontWeight = FontWeight.Bold,
-              color = Color(0xFF0F172A)
+              color = MaterialTheme.colorScheme.onSurface
             )
             Spacer(modifier = Modifier.weight(1f))
             Text(
               text = if (scenarioExpanded) "Collapse Details 🔼" else "Expand Details 🔽",
               fontSize = 11.sp,
               fontWeight = FontWeight.Medium,
-              color = Color(0xFF475569)
+              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
           }
           
@@ -4408,25 +4425,25 @@ fun FluentCityPracticeChatScreen(
             Text(
               text = "Situation: " + task.situation,
               fontSize = 12.sp,
-              color = Color(0xFF334155)
+              color = MaterialTheme.colorScheme.outline
             )
             Spacer(modifier = Modifier.height(6.dp))
             Text(
               text = "Goal: " + task.practiceGoal,
               fontSize = 12.sp,
               fontWeight = FontWeight.Bold,
-              color = Color(0xFF0F766E)
+              color = MaterialTheme.colorScheme.onPrimaryContainer
             )
             
             Spacer(modifier = Modifier.height(10.dp))
-            DividerHorizontal(color = Color(0xFFE2E8F0), thickness = 1.dp)
+            DividerHorizontal(color = MaterialTheme.colorScheme.surfaceVariant, thickness = 1.dp)
             Spacer(modifier = Modifier.height(8.dp))
             
             Text(
               text = "💡 Phrases to try using in conversation:",
               fontSize = 11.sp,
               fontWeight = FontWeight.Bold,
-              color = Color(0xFF0284C7)
+              color = MaterialTheme.colorScheme.primary
             )
             
             learningMaterials.usefulPhrases.forEach { (phrase, explanation) ->
@@ -4435,18 +4452,18 @@ fun FluentCityPracticeChatScreen(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
                 verticalAlignment = Alignment.Top
               ) {
-                Text("•", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color(0xFF14B8A6))
+                Text("•", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
                 Column {
                   Text(
                     text = phrase,
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Bold,
-                    color = Color(0xFF0F172A)
+                    color = MaterialTheme.colorScheme.onSurface
                   )
                   Text(
                     text = explanation,
                     fontSize = 10.sp,
-                    color = Color(0xFF64748B)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                   )
                 }
               }
@@ -4481,13 +4498,13 @@ fun FluentCityPracticeChatScreen(
                       bottomEnd = 16.dp
                     )
                   )
-                  .background(Color(0xFF14B8A6))
+                  .background(MaterialTheme.colorScheme.primary)
                   .padding(horizontal = 14.dp, vertical = 10.dp)
                   .widthIn(max = 300.dp)
               ) {
                 Text(
                   text = message.text,
-                  color = Color.White,
+                  color = MaterialTheme.colorScheme.onSurface,
                   fontSize = 14.sp
                 )
               }
@@ -4501,12 +4518,12 @@ fun FluentCityPracticeChatScreen(
                     .fillMaxWidth(0.92f)
                     .border(
                       width = 1.dp,
-                      color = Color(0xFFCBD5E1),
+                      color = MaterialTheme.colorScheme.onSurfaceVariant,
                       shape = RoundedCornerShape(16.dp)
                     )
                     .shadow(2.dp, RoundedCornerShape(16.dp)),
                   colors = CardDefaults.cardColors(
-                    containerColor = Color(0xFFF8FAFC)
+                    containerColor = MaterialTheme.colorScheme.background
                   ),
                   shape = RoundedCornerShape(16.dp)
                 ) {
@@ -4519,20 +4536,20 @@ fun FluentCityPracticeChatScreen(
                         text = "💯 LOCAL FEEDBACK",
                         fontSize = 11.sp,
                         fontWeight = FontWeight.ExtraBold,
-                        color = Color(0xFF14B8A6)
+                        color = MaterialTheme.colorScheme.primary
                       )
                       Spacer(modifier = Modifier.weight(1f))
                       Box(
                         modifier = Modifier
                           .clip(RoundedCornerShape(4.dp))
-                          .background(Color(0xFFEFF6FF))
+                          .background(MaterialTheme.colorScheme.primaryContainer)
                           .padding(horizontal = 6.dp, vertical = 2.dp)
                       ) {
                         Text(
                           text = "🇬🇧 London Style",
                           fontSize = 9.sp,
                           fontWeight = FontWeight.SemiBold,
-                          color = Color(0xFF1D4ED8)
+                          color = MaterialTheme.colorScheme.primary
                         )
                       }
                     }
@@ -4550,12 +4567,12 @@ fun FluentCityPracticeChatScreen(
                           text = "Analysis & Tips",
                           fontSize = 11.sp,
                           fontWeight = FontWeight.Bold,
-                          color = Color(0xFF475569)
+                          color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Text(
                           text = message.correction,
                           fontSize = 12.sp,
-                          color = Color(0xFF334155)
+                          color = MaterialTheme.colorScheme.outline
                         )
                       }
                     }
@@ -4573,13 +4590,13 @@ fun FluentCityPracticeChatScreen(
                           text = "Recommended Idiomatic Way",
                           fontSize = 11.sp,
                           fontWeight = FontWeight.Bold,
-                          color = Color(0xFF0F766E)
+                          color = MaterialTheme.colorScheme.onPrimaryContainer
                         )
                         Text(
                           text = "\"" + message.naturalVersion + "\"",
                           fontSize = 13.sp,
                           fontWeight = FontWeight.ExtraBold,
-                          color = Color(0xFF0F766E)
+                          color = MaterialTheme.colorScheme.onPrimaryContainer
                         )
                       }
                     }
@@ -4598,7 +4615,7 @@ fun FluentCityPracticeChatScreen(
                 modifier = Modifier
                   .size(32.dp)
                   .clip(CircleShape)
-                  .background(Color(0xFFE2E8F0)),
+                  .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center
               ) {
                 Text(
@@ -4614,7 +4631,7 @@ fun FluentCityPracticeChatScreen(
                   text = message.senderName,
                   fontSize = 11.sp,
                   fontWeight = FontWeight.Bold,
-                  color = Color(0xFF64748B)
+                  color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
                 Spacer(modifier = Modifier.height(2.dp))
                 Box(
@@ -4627,13 +4644,13 @@ fun FluentCityPracticeChatScreen(
                         bottomEnd = 16.dp
                       )
                     )
-                    .background(Color(0xFFF1F5F9))
+                    .background(MaterialTheme.colorScheme.surfaceVariant)
                     .padding(horizontal = 14.dp, vertical = 10.dp)
                     .widthIn(max = 300.dp)
                 ) {
                   Text(
                     text = message.text,
-                    color = Color(0xFF0F172A),
+                    color = MaterialTheme.colorScheme.onSurface,
                     fontSize = 14.sp
                   )
                 }
@@ -4653,7 +4670,7 @@ fun FluentCityPracticeChatScreen(
                 modifier = Modifier
                   .size(32.dp)
                   .clip(CircleShape)
-                  .background(Color(0xFFE2E8F0)),
+                  .background(MaterialTheme.colorScheme.surfaceVariant),
                 contentAlignment = Alignment.Center
               ) {
                 Text(
@@ -4664,7 +4681,7 @@ fun FluentCityPracticeChatScreen(
               Spacer(modifier = Modifier.width(8.dp))
               Card(
                 colors = CardDefaults.cardColors(
-                  containerColor = Color(0xFFF1F5F9).copy(alpha = 0.8f)
+                  containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.8f)
                 ),
                 shape = RoundedCornerShape(12.dp)
               ) {
@@ -4675,14 +4692,14 @@ fun FluentCityPracticeChatScreen(
                   CircularProgressIndicator(
                     modifier = Modifier.size(12.dp),
                     strokeWidth = 1.5.dp,
-                    color = Color(0xFF14B8A6)
+                    color = MaterialTheme.colorScheme.primary
                   )
                   Spacer(modifier = Modifier.width(8.dp))
                   Text(
                     text = character.name + " is thinking...",
                     fontSize = 11.sp,
                     fontWeight = FontWeight.Medium,
-                    color = Color(0xFF475569)
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                   )
                 }
               }
@@ -4704,13 +4721,13 @@ fun FluentCityPracticeChatScreen(
               .padding(horizontal = 16.dp, vertical = 6.dp)
               .border(
                 width = 1.dp,
-                color = Color(0xFF10B981).copy(alpha = 0.25f),
+                color = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.25f),
                 shape = RoundedCornerShape(14.dp)
               )
               .shadow(3.dp, RoundedCornerShape(14.dp))
               .clickable { encouragementText = null },
             colors = CardDefaults.cardColors(
-              containerColor = Color(0xFFECFDF5)
+              containerColor = MaterialTheme.colorScheme.tertiaryContainer
             ),
             shape = RoundedCornerShape(14.dp)
           ) {
@@ -4722,10 +4739,10 @@ fun FluentCityPracticeChatScreen(
                 text = "💡 Coach Tip",
                 fontWeight = FontWeight.Bold,
                 fontSize = 10.sp,
-                color = Color(0xFF047857),
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
                 modifier = Modifier
                   .clip(RoundedCornerShape(6.dp))
-                  .background(Color(0xFFD1FAE5))
+                  .background(MaterialTheme.colorScheme.tertiaryContainer)
                   .padding(horizontal = 6.dp, vertical = 3.dp)
               )
               Spacer(modifier = Modifier.width(10.dp))
@@ -4733,14 +4750,14 @@ fun FluentCityPracticeChatScreen(
                 text = text,
                 fontSize = 12.sp,
                 fontWeight = FontWeight.SemiBold,
-                color = Color(0xFF065F46),
+                color = MaterialTheme.colorScheme.onTertiaryContainer,
                 modifier = Modifier.weight(1f)
               )
               Spacer(modifier = Modifier.width(6.dp))
               Icon(
                 imageVector = Icons.Default.Close,
                 contentDescription = "Close",
-                tint = Color(0xFF047857),
+                tint = MaterialTheme.colorScheme.onTertiaryContainer,
                 modifier = Modifier
                   .size(16.dp)
                   .clickable { encouragementText = null }
@@ -4756,7 +4773,7 @@ fun FluentCityPracticeChatScreen(
         modifier = Modifier
           .fillMaxWidth()
           .navigationBarsPadding(),
-        color = Color.White
+        color = MaterialTheme.colorScheme.background.copy(alpha = 0.9f)
       ) {
         Row(
           modifier = Modifier
@@ -4773,14 +4790,17 @@ fun FluentCityPracticeChatScreen(
               .testTag("chat_input_textfield"),
             shape = RoundedCornerShape(24.dp),
             colors = OutlinedTextFieldDefaults.colors(
-              focusedTextColor = Color(0xFF0F172A),
-              unfocusedTextColor = Color(0xFF0F172A),
-              focusedBorderColor = Color(0xFF14B8A6),
-              unfocusedBorderColor = Color(0xFFCBD5E1),
-              focusedContainerColor = Color.White,
-              unfocusedContainerColor = Color.White,
-              focusedLabelColor = Color(0xFF14B8A6),
-              unfocusedLabelColor = Color(0xFF64748B)
+              focusedTextColor = MaterialTheme.colorScheme.onSurface,
+              unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+              focusedContainerColor = MaterialTheme.colorScheme.surface,
+              unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+              focusedBorderColor = MaterialTheme.colorScheme.primary,
+              unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+              focusedLabelColor = MaterialTheme.colorScheme.primary,
+              unfocusedLabelColor = MaterialTheme.colorScheme.onSurfaceVariant,
+              focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+              unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+              cursorColor = MaterialTheme.colorScheme.primary
             ),
             singleLine = true,
             keyboardOptions = KeyboardOptions(
@@ -4962,16 +4982,16 @@ fun FluentCityPracticeChatScreen(
               .size(48.dp)
               .clip(CircleShape)
               .background(
-                if (inputText.isNotBlank() && !isTyping) Color(0xFF14B8A6)
-                else Color(0xFFF1F5F9)
+                if (inputText.isNotBlank() && !isTyping) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.surfaceVariant
               )
               .testTag("chat_send_button")
           ) {
             Icon(
-              imageVector = Icons.Default.ArrowForward,
+              imageVector = Icons.AutoMirrored.Filled.ArrowForward,
               contentDescription = "Send message",
-              tint = if (inputText.isNotBlank() && !isTyping) Color.White
-                     else Color(0xFF94A3B8),
+              tint = if (inputText.isNotBlank() && !isTyping) MaterialTheme.colorScheme.onSurface
+                     else MaterialTheme.colorScheme.surfaceVariant,
               modifier = Modifier.size(18.dp)
             )
           }
@@ -5161,208 +5181,9 @@ fun getFallbackSessionFeedback(day: Int): SessionFeedback {
   }
 }
 
-data class RubricCategoryItem(
-  val id: String,
-  val name: String,
-  val icon: String,
-  val color: Color,
-  val detail: RubricScoreDetail
-)
 
-@Composable
-fun RubricCategoryCard(
-  item: RubricCategoryItem,
-  isExpanded: Boolean,
-  onToggle: () -> Unit
-) {
-  Card(
-    modifier = Modifier
-      .fillMaxWidth()
-      .animateContentSize()
-      .clickable { onToggle() }
-      .border(1.dp, if (isExpanded) item.color.copy(alpha = 0.5f) else Color(0xFFE2E8F0), RoundedCornerShape(16.dp)),
-    shape = RoundedCornerShape(16.dp),
-    colors = CardDefaults.cardColors(containerColor = Color.White)
-  ) {
-    Column(modifier = Modifier.padding(16.dp)) {
-      Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(12.dp)
-      ) {
-        // Category Icon with soft background
-        Box(
-          modifier = Modifier
-            .size(40.dp)
-            .clip(CircleShape)
-            .background(item.color.copy(alpha = 0.12f)),
-          contentAlignment = Alignment.Center
-        ) {
-          Text(text = item.icon, fontSize = 20.sp)
-        }
 
-        // Category Name
-        Column(modifier = Modifier.weight(1f)) {
-          Text(
-            text = item.name,
-            fontSize = 15.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFF0F172A)
-          )
-        }
 
-        // Score Pill
-        Box(
-          modifier = Modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(item.color.copy(alpha = 0.15f))
-            .padding(horizontal = 10.dp, vertical = 4.dp)
-        ) {
-          Text(
-            text = "${item.detail.score}/100",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.ExtraBold,
-            color = item.color
-          )
-        }
-
-        // Expand/Collapse arrow
-        Icon(
-          imageVector = if (isExpanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
-          contentDescription = if (isExpanded) "Collapse" else "Expand",
-          tint = Color(0xFF64748B),
-          modifier = Modifier.size(24.dp)
-        )
-      }
-
-      if (isExpanded) {
-        Spacer(modifier = Modifier.height(16.dp))
-        DividerHorizontal(color = Color(0xFFF1F5F9))
-        Spacer(modifier = Modifier.height(12.dp))
-
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-          // 1. Explanation
-          Column {
-            Text(
-              text = "Coach Explanation",
-              fontSize = 11.sp,
-              fontWeight = FontWeight.ExtraBold,
-              color = Color(0xFF64748B),
-              letterSpacing = 0.5.sp
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-              text = item.detail.explanation,
-              fontSize = 13.sp,
-              color = Color(0xFF1E293B),
-              lineHeight = 18.sp
-            )
-          }
-
-          // 2. Correction
-          if (item.detail.correction.isNotBlank() && item.detail.correction != "None") {
-            Box(
-              modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color(0xFFFEF2F2))
-                .border(1.dp, Color(0xFFFEE2E2), RoundedCornerShape(12.dp))
-                .padding(12.dp)
-            ) {
-              Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  Text("⚠️", fontSize = 13.sp)
-                  Spacer(modifier = Modifier.width(6.dp))
-                  Text(
-                    text = "Suggested Correction",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF991B1B)
-                  )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = item.detail.correction,
-                  fontSize = 13.sp,
-                  fontWeight = FontWeight.SemiBold,
-                  color = Color(0xFF7F1D1D),
-                  lineHeight = 18.sp
-                )
-              }
-            }
-          }
-
-          // 3. More Natural Version
-          if (item.detail.naturalVersion.isNotBlank()) {
-            Box(
-              modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color(0xFFF0FDF4))
-                .border(1.dp, Color(0xFFDCFCE7), RoundedCornerShape(12.dp))
-                .padding(12.dp)
-            ) {
-              Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  Text("🇬🇧", fontSize = 13.sp)
-                  Spacer(modifier = Modifier.width(6.dp))
-                  Text(
-                    text = "More Natural British Version",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF166534)
-                  )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = item.detail.naturalVersion,
-                  fontSize = 13.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = Color(0xFF14532D),
-                  lineHeight = 18.sp
-                )
-              }
-            }
-          }
-
-          // 4. Next Practice Step
-          if (item.detail.nextPracticeStep.isNotBlank()) {
-            Box(
-              modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
-                .background(Color(0xFFEFF6FF))
-                .border(1.dp, Color(0xFFDBEAFE), RoundedCornerShape(12.dp))
-                .padding(12.dp)
-            ) {
-              Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                  Text("🎯", fontSize = 13.sp)
-                  Spacer(modifier = Modifier.width(6.dp))
-                  Text(
-                    text = "Practice This Next",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF1E40AF)
-                  )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = item.detail.nextPracticeStep,
-                  fontSize = 13.sp,
-                  fontWeight = FontWeight.Medium,
-                  color = Color(0xFF1E3A8A),
-                  lineHeight = 18.sp
-                )
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
-@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
 @Composable
 fun PracticeFeedbackScreen(
   task: DayTask,
@@ -5373,15 +5194,13 @@ fun PracticeFeedbackScreen(
   onCompleted: () -> Unit,
   onBackToChat: () -> Unit
 ) {
-  val scrollState = rememberScrollState()
-
   Scaffold(
     modifier = Modifier.fillMaxSize(),
     topBar = {
       Box(
         modifier = Modifier
           .fillMaxWidth()
-          .background(Color(0xFF0F172A))
+          .background(MaterialTheme.colorScheme.background)
           .padding(
             top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 12.dp,
             bottom = 16.dp,
@@ -5394,57 +5213,33 @@ fun PracticeFeedbackScreen(
             verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.fillMaxWidth()
           ) {
-            // Coach Avatar icon at the top
             Box(
               modifier = Modifier
                 .size(36.dp)
                 .clip(CircleShape)
-                .background(Color(0xFF1E293B))
-                .border(1.dp, Color(0xFF14B8A6), CircleShape),
+                .background(MaterialTheme.colorScheme.surface)
+                .border(1.dp, MaterialTheme.colorScheme.primary, CircleShape),
               contentAlignment = Alignment.Center
             ) {
-              Text(
-                text = character.avatar,
-                fontSize = 18.sp
-              )
+              Text(text = character.avatar, fontSize = 18.sp)
             }
             Spacer(modifier = Modifier.width(10.dp))
             Column {
               Text(
                 text = "${character.name}'s Feedback",
-                style = MaterialTheme.typography.titleMedium.copy(
-                  fontWeight = FontWeight.Bold,
-                  letterSpacing = (-0.3).sp
-                ),
-                color = Color.White
-              )
-              Text(
-                text = "Linguistic Coaching Review",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Medium,
-                color = Color(0xFF14B8A6)
+                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold, letterSpacing = (-0.3).sp),
+                color = MaterialTheme.colorScheme.onSurface
               )
             }
             Spacer(modifier = Modifier.weight(1f))
             TextButton(
               onClick = onBackToChat,
               contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-              colors = ButtonDefaults.textButtonColors(contentColor = Color(0xFF14B8A6))
+              colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.primary)
             ) {
               Text("Back 💬", fontSize = 11.sp, fontWeight = FontWeight.Bold)
             }
           }
-          
-          Spacer(modifier = Modifier.height(8.dp))
-          
-          // Scenario title at the top
-          Text(
-            text = "Scenario: ${task.title}",
-            style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.SemiBold),
-            color = Color.White.copy(alpha = 0.85f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-          )
         }
       }
     }
@@ -5452,7 +5247,7 @@ fun PracticeFeedbackScreen(
     Box(
       modifier = Modifier
         .fillMaxSize()
-        .background(Color(0xFFF8FAFC)) // Very clean slate-blue canvas
+        .background(MaterialTheme.colorScheme.background)
         .padding(paddingValues),
       contentAlignment = Alignment.Center
     ) {
@@ -5463,1170 +5258,174 @@ fun PracticeFeedbackScreen(
           modifier = Modifier.padding(24.dp)
         ) {
           CircularProgressIndicator(
-            color = Color(0xFF14B8A6),
+            color = MaterialTheme.colorScheme.primary,
             strokeWidth = 3.5.dp,
             modifier = Modifier.size(48.dp)
           )
           Spacer(modifier = Modifier.height(16.dp))
           Text(
-            text = "Generating Coach Evaluation...",
+            text = "Reviewing your practice...",
             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-            color = Color(0xFF0F172A)
-          )
-          Spacer(modifier = Modifier.height(6.dp))
-          Text(
-            text = "Gemini is reviewing your sentence structures, politeness indices, and regional British phrasing.",
-            style = MaterialTheme.typography.bodySmall,
-            color = Color(0xFF64748B),
-            textAlign = TextAlign.Center
+            color = MaterialTheme.colorScheme.onSurface
           )
         }
       } else if (feedback != null) {
-        var expandedCategoryId by remember(feedback) { mutableStateOf<String?>(null) }
-        val rubricItems = remember(feedback) {
-          listOf(
-            RubricCategoryItem("task", "Task Completion", "🎯", Color(0xFF10B981), feedback.taskCompletion),
-            RubricCategoryItem("grammar", "Grammar", "🔧", Color(0xFF3B82F6), feedback.grammar),
-            RubricCategoryItem("vocabulary", "Vocabulary", "💡", Color(0xFFF59E0B), feedback.vocabulary),
-            RubricCategoryItem("fluency", "Fluency", "⚡", Color(0xFFEC4899), feedback.fluency),
-            RubricCategoryItem("naturalness", "Naturalness", "🇬🇧", Color(0xFF8B5CF6), feedback.naturalness),
-            RubricCategoryItem("formality", "Formality Match", "👔", Color(0xFF06B6D4), feedback.formalityMatch),
-            RubricCategoryItem("clarity", "Clarity", "🔍", Color(0xFF64748B), feedback.clarity)
-          )
-        }
-        val averageScore = remember(feedback) {
-          (feedback.taskCompletion.score + 
-           feedback.grammar.score + 
-           feedback.vocabulary.score + 
-           feedback.fluency.score + 
-           feedback.naturalness.score + 
-           feedback.formalityMatch.score + 
-           feedback.clarity.score) / 7
-        }
-
         Column(
           modifier = Modifier
             .fillMaxSize()
-            .verticalScroll(scrollState)
-            .padding(horizontal = 16.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp),
+          horizontalAlignment = Alignment.CenterHorizontally
         ) {
-          Spacer(modifier = Modifier.height(16.dp))
-
-          // 1. Sleek score circular dashboard
-          Card(
-            modifier = Modifier
-              .fillMaxWidth()
-              .shadow(1.dp, RoundedCornerShape(20.dp)),
-            shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White)
-          ) {
-            Column(
-              modifier = Modifier.padding(20.dp),
-              horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-              Text(
-                text = "OVERALL PERFORMANCE RATINGS",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.ExtraBold,
-                color = Color(0xFF64748B),
-                letterSpacing = 1.sp
-              )
-              
-              Spacer(modifier = Modifier.height(16.dp))
-              
-              Box(
-                modifier = Modifier
-                  .size(100.dp)
-                  .clip(CircleShape)
-                  .background(Color(0xFFF8FAFC)),
-                contentAlignment = Alignment.Center
-              ) {
-                Canvas(modifier = Modifier.size(88.dp)) {
-                  drawArc(
-                    color = Color(0xFFE2E8F0),
-                    startAngle = 0f,
-                    sweepAngle = 360f,
-                    useCenter = false,
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 8.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
-                  )
-                  val scoreFraction = averageScore / 100f
-                  drawArc(
-                    color = Color(0xFF14B8A6),
-                    startAngle = -90f,
-                    sweepAngle = scoreFraction * 360f,
-                    useCenter = false,
-                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 8.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
-                  )
-                }
-                
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                  Text(
-                    text = "$averageScore",
-                    fontSize = 28.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF0F172A)
-                  )
-                  Text(
-                    text = "out of 100",
-                    fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF64748B)
-                  )
-                }
-              }
-
-              Spacer(modifier = Modifier.height(16.dp))
-              
-              Text(
-                text = "Tap on any rubric area below to inspect friendly explanations, corrections, and native practice targets.",
-                fontSize = 12.sp,
-                color = Color(0xFF475569),
-                textAlign = TextAlign.Center,
-                lineHeight = 16.sp
-              )
-            }
-          }
-
-          // Before & After Improvement Card
-          feedback.improvement?.let { imp ->
-            Spacer(modifier = Modifier.height(20.dp))
-            Card(
-              modifier = Modifier
-                .fillMaxWidth()
-                .shadow(1.dp, RoundedCornerShape(20.dp)),
-              shape = RoundedCornerShape(20.dp),
-              colors = CardDefaults.cardColors(containerColor = Color.White)
-            ) {
-              Column(modifier = Modifier.padding(20.dp)) {
-                Row(
-                  verticalAlignment = Alignment.CenterVertically,
-                  horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                  Text("✨", fontSize = 20.sp)
-                  Text(
-                    text = "Before & After Improvement",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF0F172A)
-                  )
-                  Spacer(modifier = Modifier.weight(1f))
-                  Box(
-                    modifier = Modifier
-                      .clip(RoundedCornerShape(12.dp))
-                      .background(Color(0xFFEFF6FF))
-                      .padding(horizontal = 10.dp, vertical = 4.dp)
-                  ) {
-                    Text(
-                      text = imp.mistakeType,
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.Bold,
-                      color = Color(0xFF1D4ED8)
-                    )
-                  }
-                }
-                
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Before Section
-                Column(
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFF8FAFC))
-                    .padding(12.dp)
-                ) {
-                  Box(
-                    modifier = Modifier
-                      .clip(RoundedCornerShape(6.dp))
-                      .background(Color(0xFFEF4444).copy(alpha = 0.1f))
-                      .padding(horizontal = 8.dp, vertical = 2.dp)
-                  ) {
-                    Text(
-                      text = "Before",
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.ExtraBold,
-                      color = Color(0xFFDC2626)
-                    )
-                  }
-                  Spacer(modifier = Modifier.height(6.dp))
-                  Text(
-                    text = imp.userOriginal,
-                    fontSize = 13.sp,
-                    color = Color(0xFF64748B),
-                    fontWeight = FontWeight.Medium,
-                    fontStyle = FontStyle.Italic
-                  )
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Better Section
-                Column(
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFEFF6FF))
-                    .padding(12.dp)
-                ) {
-                  Box(
-                    modifier = Modifier
-                      .clip(RoundedCornerShape(6.dp))
-                      .background(Color(0xFF3B82F6).copy(alpha = 0.1f))
-                      .padding(horizontal = 8.dp, vertical = 2.dp)
-                  ) {
-                    Text(
-                      text = "Better",
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.ExtraBold,
-                      color = Color(0xFF2563EB)
-                    )
-                  }
-                  Spacer(modifier = Modifier.height(6.dp))
-                  Text(
-                    text = imp.corrected,
-                    fontSize = 13.sp,
-                    color = Color(0xFF1E293B),
-                    fontWeight = FontWeight.SemiBold
-                  )
-                }
-
-                Spacer(modifier = Modifier.height(10.dp))
-
-                // Natural Section
-                Column(
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFECFDF5))
-                    .padding(12.dp)
-                ) {
-                  Box(
-                    modifier = Modifier
-                      .clip(RoundedCornerShape(6.dp))
-                      .background(Color(0xFF10B981).copy(alpha = 0.1f))
-                      .padding(horizontal = 8.dp, vertical = 2.dp)
-                  ) {
-                    Text(
-                      text = "Natural",
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.ExtraBold,
-                      color = Color(0xFF059669)
-                    )
-                  }
-                  Spacer(modifier = Modifier.height(6.dp))
-                  Text(
-                    text = imp.natural,
-                    fontSize = 14.sp,
-                    color = Color(0xFF065F46),
-                    fontWeight = FontWeight.Bold
-                  )
-                }
-
-                Spacer(modifier = Modifier.height(16.dp))
-                DividerHorizontal(color = Color(0xFFF1F5F9))
-                Spacer(modifier = Modifier.height(12.dp))
-
-                // Motivating description
-                Row(
-                  verticalAlignment = Alignment.CenterVertically,
-                  horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                  Text("🏆", fontSize = 18.sp)
-                  Text(
-                    text = "You improved this sentence by making it clearer, more natural, and more suitable for the situation.",
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold,
-                    color = Color(0xFF0F172A),
-                    lineHeight = 16.sp
-                  )
-                }
-              }
-            }
-          }
-
-          Spacer(modifier = Modifier.height(20.dp))
-
-          Text(
-            text = "DETAILED FEEDBACK RUBRIC",
-            fontSize = 11.sp,
-            fontWeight = FontWeight.ExtraBold,
-            color = Color(0xFF64748B),
-            letterSpacing = 0.5.sp,
-            modifier = Modifier.padding(start = 4.dp, bottom = 12.dp)
-          )
-
-          // 2. Collapsible rubric card items
-          Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            rubricItems.forEach { item ->
-              RubricCategoryCard(
-                item = item,
-                isExpanded = expandedCategoryId == item.id,
-                onToggle = {
-                  expandedCategoryId = if (expandedCategoryId == item.id) null else item.id
-                }
-              )
-            }
-          }
-
           Spacer(modifier = Modifier.height(24.dp))
-
-          // Finish practice action button
+          
+          Text("🎉", fontSize = 64.sp)
+          Spacer(modifier = Modifier.height(16.dp))
+          
+          Text(
+            text = "Great job today!",
+            style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.ExtraBold),
+            color = MaterialTheme.colorScheme.primary
+          )
+          
+          Spacer(modifier = Modifier.height(8.dp))
+          Text(
+            text = "You sounded clearer today. Let's keep practicing to build smoother sentences.",
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+          )
+          
+          Spacer(modifier = Modifier.height(48.dp))
+          
+          feedback.improvement?.let { imp ->
+            Card(
+              modifier = Modifier.fillMaxWidth(),
+              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
+              shape = RoundedCornerShape(16.dp)
+            ) {
+              Column(modifier = Modifier.padding(16.dp)) {
+                Text("Tip for next time:", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Spacer(modifier = Modifier.height(8.dp))
+                
+                Text("Instead of saying:", fontSize = 12.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("\"${imp.userOriginal}\"", fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurface)
+                
+                Spacer(modifier = Modifier.height(12.dp))
+                
+                Text("Try making it more natural:", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                Text("\"${imp.natural}\"", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onPrimaryContainer)
+              }
+            }
+            Spacer(modifier = Modifier.height(32.dp))
+          }
+          
+          Spacer(modifier = Modifier.weight(1f))
+          
           Button(
             onClick = onCompleted,
             modifier = Modifier
               .fillMaxWidth()
-              .height(52.dp)
-              .testTag("feedback_finish_button")
-              .shadow(4.dp, RoundedCornerShape(26.dp)),
-            shape = RoundedCornerShape(26.dp),
-            colors = ButtonDefaults.buttonColors(
-              containerColor = Color(0xFF14B8A6),
-              contentColor = Color.White
-            )
+              .height(56.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+            shape = RoundedCornerShape(16.dp)
           ) {
-            Text(
-              text = "Apply Feedback & Complete Day 🚀",
-              fontWeight = FontWeight.Bold,
-              fontSize = 15.sp
-            )
+            Text("Finish Practice", fontSize = 16.sp, fontWeight = FontWeight.Bold)
           }
-
-          Spacer(modifier = Modifier.height(32.dp))
+          
+          Spacer(modifier = Modifier.height(24.dp))
         }
       }
     }
   }
 }
 
-@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FluentCityReviewScreen(
   reviewItems: List<ReviewItem>,
   recordedMistakes: List<RecordedMistake> = emptyList(),
-  simulatedTimeOffsetDays: Int,
-  onUpdateItem: (ReviewItem) -> Unit,
+  simulatedTimeOffsetDays: Int = 0,
+  onUpdateItem: (ReviewItem) -> Unit = {},
   onBack: () -> Unit
 ) {
-  val simulatedCurrentTime = remember(simulatedTimeOffsetDays) {
-    System.currentTimeMillis() + (simulatedTimeOffsetDays.toLong() * 24 * 60 * 60 * 1000)
-  }
-  
-  val dueReviews = remember(reviewItems, simulatedCurrentTime) {
-    reviewItems.filter { item -> simulatedCurrentTime >= item.nextReviewTimeMillis }
-  }
-  
-  // Sort or prioritize items that correspond to mistakes repeated more than once!
-  val activeReviewDeck = remember(dueReviews, reviewItems, recordedMistakes) {
-    val baseList = if (dueReviews.isNotEmpty()) dueReviews else reviewItems
-    baseList.sortedWith(compareByDescending<ReviewItem> { item ->
-      if (item.type == "mistake") {
-        val matchingMistake = recordedMistakes.find {
-          item.originalPrompt.contains(it.phrase, ignoreCase = true) ||
-          item.targetPhrase.equals(it.correction, ignoreCase = true)
-        }
-        matchingMistake?.occurrenceCount ?: 1
-      } else {
-        1
-      }
-    }.thenBy { it.nextReviewTimeMillis })
-  }
-  
-  var currentCardIndex by remember { mutableStateOf(0) }
-  var userRecallInput by remember { mutableStateOf("") }
-  var isSubmitted by remember { mutableStateOf(false) }
-  var isEvaluating by remember { mutableStateOf(false) }
-  var scoreResult by remember { mutableStateOf<Int?>(null) }
-  var feedbackResult by remember { mutableStateOf<String?>(null) }
-  
-  val currentItem = remember(currentCardIndex, activeReviewDeck) {
-    if (currentCardIndex < activeReviewDeck.size) activeReviewDeck[currentCardIndex] else null
-  }
-  
-  val coroutineScope = rememberCoroutineScope()
-
-  val taskType = remember(currentItem, currentCardIndex) {
-    if (currentItem == null) "rewrite_natural"
-    else {
-      val types = listOf(
-        "fill_gap",
-        "rewrite_natural",
-        "use_in_sentence",
-        "roleplay",
-        "choose_option"
-      )
-      types[currentCardIndex % types.size]
-    }
-  }
-
-  val gapTaskData = remember(currentItem, taskType) {
-    if (currentItem != null && taskType == "fill_gap") {
-      val commonGaps = listOf("under the weather", "grab", "fancy a cuppa", "mind the gap", "flat white", "quid", "gutted", "knackered", "cheers", "sorted", "chap", "cheerio", "tenner", "fiver", "innit")
-      var sentence = currentItem.targetPhrase
-      var missing = ""
-      for (gap in commonGaps) {
-        if (sentence.contains(gap, ignoreCase = true)) {
-          val idx = sentence.indexOf(gap, ignoreCase = true)
-          if (idx != -1) {
-            missing = sentence.substring(idx, idx + gap.length)
-            sentence = sentence.replace(missing, "[_____]", ignoreCase = true)
-            break
-          }
-        }
-      }
-      if (missing.isEmpty()) {
-        val words = sentence.split(Regex("[^a-zA-Z]+")).filter { it.length > 3 }
-        if (words.isNotEmpty()) {
-          missing = words.maxByOrNull { it.length } ?: ""
-          if (missing.isNotEmpty()) {
-            sentence = sentence.replace(missing, "[_____]", ignoreCase = true)
-          }
-        }
-      }
-      Pair(sentence, missing)
-    } else {
-      Pair("", "")
-    }
-  }
-
-  val multipleChoiceOptions = remember(currentItem, taskType) {
-    if (currentItem != null && taskType == "choose_option") {
-      val correct = currentItem.targetPhrase
-      var incorrect = ""
-      if (currentItem.type == "mistake") {
-        val regex = "\"([^\"]+)\"".toRegex()
-        val match = regex.find(currentItem.originalPrompt)
-        incorrect = match?.groupValues?.get(1) ?: ""
-      }
-      if (incorrect.isBlank()) {
-        val p = correct.lowercase()
-        incorrect = when {
-          p.contains("grab") -> correct.replace("Could I grab", "Give me", ignoreCase = true).replace(", please", "", ignoreCase = true)
-          p.contains("under the weather") -> correct.replace("under the weather", "sick", ignoreCase = true)
-          p.contains("cuppa") -> "Do you want tea?"
-          p.contains("mind the gap") -> "Watch out for the hole."
-          p.contains("cheers") -> "Thank you."
-          p.contains("sorted") -> "Everything is done."
-          p.contains("gutted") -> "I am very sad."
-          p.contains("knackered") -> "I am extremely tired."
-          else -> "I want " + correct.replace("Could I ", "").replace(", please", "")
-        }
-      }
-      val options = listOf(correct, incorrect).distinct().shuffled()
-      options
-    } else {
-      emptyList()
-    }
-  }
-  
   Scaffold(
-    modifier = Modifier.fillMaxSize(),
     topBar = {
-      Box(
-        modifier = Modifier
-          .fillMaxWidth()
-          .background(Color(0xFF0F172A))
-          .padding(
-            top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
-            bottom = 12.dp,
-            start = 12.dp,
-            end = 16.dp
-          )
-      ) {
-        Row(
-          verticalAlignment = Alignment.CenterVertically,
-          modifier = Modifier.fillMaxWidth()
-        ) {
+      TopAppBar(
+        title = { Text("Review Mode", fontWeight = FontWeight.Bold) },
+        navigationIcon = {
           IconButton(onClick = onBack) {
-            Icon(imageVector = Icons.Default.ArrowBack, contentDescription = "Back", tint = Color.White)
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
           }
-          Spacer(modifier = Modifier.width(8.dp))
-          Text(
-            text = "Active Recall Review 🧠",
-            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-            color = Color.White
-          )
-        }
-      }
-    }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
+      )
+    },
+    containerColor = MaterialTheme.colorScheme.background
   ) { paddingValues ->
-    Column(
-      modifier = Modifier
-        .fillMaxSize()
-        .background(Color(0xFFF8FAFC))
-        .padding(paddingValues)
-        .padding(16.dp),
-      horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-      if (currentItem != null) {
-        // 1. PROGRESS BAR
-        val progress = if (activeReviewDeck.isNotEmpty()) (currentCardIndex.toFloat() / activeReviewDeck.size.toFloat()) else 0f
-        Text(
-          text = "Card ${currentCardIndex + 1} of ${activeReviewDeck.size}",
-          fontSize = 12.sp,
-          fontWeight = FontWeight.Bold,
-          color = Color(0xFF64748B)
-        )
-        Spacer(modifier = Modifier.height(6.dp))
-        LinearProgressIndicator(
-          progress = progress,
-          modifier = Modifier
-            .fillMaxWidth()
-            .height(6.dp)
-            .clip(RoundedCornerShape(3.dp)),
-          color = Color(0xFFF59E0B),
-          trackColor = Color(0xFFE2E8F0)
-        )
-        
+    if (reviewItems.isEmpty()) {
+      Column(
+        modifier = Modifier
+          .fillMaxSize()
+          .padding(paddingValues),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+      ) {
+        Text("🎉", fontSize = 64.sp)
         Spacer(modifier = Modifier.height(16.dp))
-        
-        // 2. ACTIVE RECALL CARD
-        Card(
-          shape = RoundedCornerShape(20.dp),
-          colors = CardDefaults.cardColors(containerColor = Color.White),
-          modifier = Modifier
-            .fillMaxWidth()
-            .weight(1f)
-            .shadow(4.dp, RoundedCornerShape(20.dp))
-            .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(20.dp)),
-        ) {
-          Column(
-            modifier = Modifier
-              .padding(20.dp)
-              .verticalScroll(rememberScrollState())
-          ) {
-            // Header context
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-              Box(
-                modifier = Modifier
-                  .clip(RoundedCornerShape(6.dp))
-                  .background(if (currentItem.type == "phrase") Color(0xFFE0F2FE) else Color(0xFFFEE2E2))
-                  .padding(horizontal = 8.dp, vertical = 4.dp)
-              ) {
-                Text(
-                  text = if (currentItem.type == "phrase") "Phrase Recall" else "Mistake Correction",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.ExtraBold,
-                  color = if (currentItem.type == "phrase") Color(0xFF0369A1) else Color(0xFF991B1B)
-                )
-              }
-              
-              Text(
-                text = currentItem.context,
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF64748B)
-              )
-            }
-            
-            Spacer(modifier = Modifier.height(12.dp))
-
-            // Task Type Label & Instructions
-            val taskTitle = when (taskType) {
-              "fill_gap" -> "Task 1: Fill the Gap 🔤"
-              "rewrite_natural" -> "Task 2: Rewrite Naturally ✍️"
-              "use_in_sentence" -> "Task 3: Use Expression in Sentence 💡"
-              "roleplay" -> "Task 4: Scenario Roleplay Turn 🎭"
-              "choose_option" -> "Task 5: Choose Natural British Option 🎯"
-              else -> "Active Recall"
-            }
-            val taskInstruction = when (taskType) {
-              "fill_gap" -> "Type the missing British word(s) that complete the gap '[_____]'."
-              "rewrite_natural" -> "Rewrite the sentence below to make it sound like a polite, natural Southern British local speaker."
-              "use_in_sentence" -> "Write a brand new, natural sentence of your own incorporating the British expression: \"${currentItem.targetPhrase}\""
-              "roleplay" -> "Respond to the roleplay scenario. You must include the phrase: \"${currentItem.targetPhrase}\""
-              "choose_option" -> "Select the option that sounds more polite and naturally Southern British."
-              else -> ""
-            }
-
-            Text(
-              text = taskTitle,
-              fontSize = 14.sp,
-              fontWeight = FontWeight.Black,
-              color = Color(0xFFF59E0B)
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-              text = taskInstruction,
-              fontSize = 12.sp,
-              fontWeight = FontWeight.Medium,
-              color = Color(0xFF475569),
-              lineHeight = 16.sp
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-            DividerHorizontal(color = Color(0xFFF1F5F9), thickness = 1.dp)
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // PROMPT
-            if (taskType != "fill_gap" && taskType != "choose_option") {
-              Text(
-                text = "Prompt: " + currentItem.originalPrompt,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF0F172A),
-                lineHeight = 20.sp
-              )
-              Spacer(modifier = Modifier.height(16.dp))
-            }
-            
-            if (!isSubmitted) {
-              // INPUT AREA OR SELECTION AREA
-              when (taskType) {
-                "choose_option" -> {
-                  Text(
-                    text = "SELECT THE BEST OPTION",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color(0xFF64748B),
-                    letterSpacing = 1.sp
-                  )
-                  Spacer(modifier = Modifier.height(8.dp))
-                  
-                  multipleChoiceOptions.forEach { option ->
-                    val isSelected = (userRecallInput == option)
-                    Card(
-                      onClick = {
-                        userRecallInput = option
-                      },
-                      shape = RoundedCornerShape(12.dp),
-                      colors = CardDefaults.cardColors(
-                        containerColor = if (isSelected) Color(0xFFFEF3C7) else Color.White
-                      ),
-                      modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 4.dp)
-                        .border(
-                          width = if (isSelected) 2.dp else 1.dp,
-                          color = if (isSelected) Color(0xFFF59E0B) else Color(0xFFCBD5E1),
-                          shape = RoundedCornerShape(12.dp)
-                        )
-                        .testTag("option_${option.take(15).replace(" ", "_")}")
-                    ) {
-                      Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                      ) {
-                        RadioButton(
-                          selected = isSelected,
-                          onClick = {
-                            userRecallInput = option
-                          },
-                          colors = RadioButtonDefaults.colors(selectedColor = Color(0xFFF59E0B))
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                          text = option,
-                          fontSize = 13.sp,
-                          fontWeight = FontWeight.Bold,
-                          color = Color(0xFF0F172A)
-                        )
-                      }
-                    }
-                  }
-                }
-                "fill_gap" -> {
-                  Box(
-                    modifier = Modifier
-                      .fillMaxWidth()
-                      .background(Color(0xFFF1F5F9), RoundedCornerShape(12.dp))
-                      .padding(16.dp)
-                  ) {
-                    Text(
-                      text = gapTaskData.first,
-                      fontSize = 15.sp,
-                      fontWeight = FontWeight.Bold,
-                      color = Color(0xFF0F172A),
-                      lineHeight = 22.sp
-                    )
-                  }
-                  Spacer(modifier = Modifier.height(16.dp))
-                  
-                  Text(
-                    text = "TYPE THE MISSING WORDS",
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color(0xFF64748B),
-                    letterSpacing = 1.sp
-                  )
-                  Spacer(modifier = Modifier.height(8.dp))
-                  
-                  OutlinedTextField(
-                    value = userRecallInput,
-                    onValueChange = { userRecallInput = it },
-                    placeholder = {
-                      Text(
-                        text = "Type the missing word(s) to fill the gap...",
-                        fontSize = 13.sp,
-                        color = Color(0xFF94A3B8)
-                      )
-                    },
-                    modifier = Modifier
-                      .fillMaxWidth()
-                      .height(60.dp)
-                      .testTag("review_recall_input"),
-                    singleLine = true,
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                      focusedBorderColor = Color(0xFFF59E0B),
-                      unfocusedBorderColor = Color(0xFFCBD5E1)
-                    )
-                  )
-                }
-                else -> {
-                  val inputLabel = when (taskType) {
-                    "rewrite_natural" -> "YOUR REWRITTEN SENTENCE"
-                    "use_in_sentence" -> "YOUR NEW SENTENCE"
-                    "roleplay" -> "YOUR ROLEPLAY RESPONSE"
-                    else -> "YOUR RECALL ANSWER"
-                  }
-                  val placeholderText = when (taskType) {
-                    "rewrite_natural" -> "Type the fully rewritten British sentence..."
-                    "use_in_sentence" -> "Write a brand new sentence utilizing this phrase..."
-                    "roleplay" -> "Respond appropriately to the scenario..."
-                    else -> "Type how you would naturally formulate this..."
-                  }
-                  
-                  Text(
-                    text = inputLabel,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color(0xFF64748B),
-                    letterSpacing = 1.sp
-                  )
-                  Spacer(modifier = Modifier.height(8.dp))
-                  
-                  OutlinedTextField(
-                    value = userRecallInput,
-                    onValueChange = { userRecallInput = it },
-                    placeholder = {
-                      Text(
-                        text = placeholderText,
-                        fontSize = 13.sp,
-                        color = Color(0xFF94A3B8)
-                      )
-                    },
-                    modifier = Modifier
-                      .fillMaxWidth()
-                      .height(110.dp)
-                      .testTag("review_recall_input"),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = OutlinedTextFieldDefaults.colors(
-                      focusedBorderColor = Color(0xFFF59E0B),
-                      unfocusedBorderColor = Color(0xFFCBD5E1)
-                    )
-                  )
-                }
-              }
-              
-              Spacer(modifier = Modifier.height(24.dp))
-              
-              Button(
-                onClick = {
-                  if (userRecallInput.isNotBlank()) {
-                    isEvaluating = true
-                    coroutineScope.launch {
-                      try {
-                        val result = GeminiAnalyzer.evaluateReviewRecall(
-                          prompt = currentItem.originalPrompt,
-                          targetPhrase = currentItem.targetPhrase,
-                          userAnswer = userRecallInput,
-                          taskType = taskType,
-                          context = currentItem.context
-                        )
-                        scoreResult = result.first
-                        feedbackResult = result.second
-                      } catch (e: Exception) {
-                        Log.e("FluentCityReview", "Evaluation fail", e)
-                        val score = GeminiAnalyzer.calculateLocalRecallScore(userRecallInput, currentItem.targetPhrase, taskType)
-                        scoreResult = score
-                        feedbackResult = "Local match evaluation. Expecting matching elements with: \"${currentItem.targetPhrase}\""
-                      } finally {
-                        isEvaluating = false
-                        isSubmitted = true
-                      }
-                    }
-                  }
-                },
-                enabled = userRecallInput.isNotBlank() && !isEvaluating,
-                shape = RoundedCornerShape(24.dp),
-                colors = ButtonDefaults.buttonColors(
-                  containerColor = Color(0xFFF59E0B),
-                  disabledContainerColor = Color(0xFFE2E8F0)
-                ),
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .height(48.dp)
-                  .testTag("submit_recall_button")
-              ) {
-                if (isEvaluating) {
-                  CircularProgressIndicator(color = Color.White, modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                  Spacer(modifier = Modifier.width(10.dp))
-                  Text("Coaches evaluating...", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                } else {
-                  Text("Submit Answer 🎯", fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                }
-              }
-            } else {
-              // SUBMITTED METRICS & COACH EVALUATION
-              Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(10.dp)
-              ) {
-                Box(
-                  modifier = Modifier
-                    .size(48.dp)
-                    .clip(CircleShape)
-                    .background(
-                      when {
-                        (scoreResult ?: 0) >= 80 -> Color(0xFFDCFCE7)
-                        (scoreResult ?: 0) >= 50 -> Color(0xFFFEF3C7)
-                        else -> Color(0xFFFEE2E2)
-                      }
-                    ),
-                  contentAlignment = Alignment.Center
-                ) {
-                  Text(
-                    text = "${scoreResult ?: 0}%",
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.Black,
-                    color = when {
-                      (scoreResult ?: 0) >= 80 -> Color(0xFF15803D)
-                      (scoreResult ?: 0) >= 50 -> Color(0xFFB45309)
-                      else -> Color(0xFF991B1B)
-                    }
-                  )
-                }
-                
-                Column {
-                  Text(
-                    text = when {
-                      (scoreResult ?: 0) >= 85 -> "Outstanding Recall! 🇬🇧"
-                      (scoreResult ?: 0) >= 60 -> "Good Communicative Attempt!"
-                      else -> "Keep Practising!"
-                    },
-                    fontSize = 14.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = Color(0xFF0F172A)
-                  )
-                  Text(
-                    text = "Linguistic Accuracy Evaluation Score",
-                    fontSize = 11.sp,
-                    color = Color(0xFF64748B)
-                  )
-                }
-              }
-              
-              Spacer(modifier = Modifier.height(16.dp))
-              
-              // Your explanation box
-              Column(
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .clip(RoundedCornerShape(12.dp))
-                  .background(Color(0xFFF1F5F9))
-                  .padding(14.dp)
-              ) {
-                Text(
-                  text = if (taskType == "fill_gap") "GAP FILL SOLUTION" else "IDEAL NATIVE FORMULATION",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.Black,
-                  color = Color(0xFF475569),
-                  letterSpacing = 0.5.sp
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = if (taskType == "fill_gap") "Missing word: \"${gapTaskData.second}\"\nComplete: \"${currentItem.targetPhrase}\"" else currentItem.targetPhrase,
-                  fontSize = 14.sp,
-                  fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF0C4A6E),
-                  lineHeight = 18.sp
-                )
-                
-                currentItem.explanation.takeIf { it.isNotBlank() }?.let { expl ->
-                  Spacer(modifier = Modifier.height(8.dp))
-                  Text(
-                    text = expl,
-                    fontSize = 11.sp,
-                    color = Color(0xFF334155),
-                    lineHeight = 15.sp
-                  )
-                }
-              }
-              
-              // Coach live analysis response
-              feedbackResult?.let { feedback ->
-                Spacer(modifier = Modifier.height(12.dp))
-                Row(
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(Color(0xFFECFDF5))
-                    .padding(14.dp),
-                  horizontalArrangement = Arrangement.spacedBy(10.dp),
-                  verticalAlignment = Alignment.Top
-                ) {
-                  Text("💬", fontSize = 16.sp)
-                  Column {
-                    Text(
-                      text = "COACH TIP",
-                      fontSize = 10.sp,
-                      fontWeight = FontWeight.Black,
-                      color = Color(0xFF047857),
-                      letterSpacing = 0.5.sp
-                    )
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                      text = feedback,
-                      fontSize = 12.sp,
-                      color = Color(0xFF065F46),
-                      lineHeight = 16.sp,
-                      fontWeight = FontWeight.SemiBold
-                    )
-                  }
-                }
-              }
-              
-              Spacer(modifier = Modifier.height(24.dp))
-              DividerHorizontal(color = Color(0xFFF1F5F9), thickness = 1.dp)
-              Spacer(modifier = Modifier.height(16.dp))
-              
-              // 3. SCHEDULE RATINGS ACTION BUTTONS
-              Text(
-                text = "HOW WELL DID YOU RECALL THIS?",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFF475569),
-                letterSpacing = 0.8.sp,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth()
-              )
-              Spacer(modifier = Modifier.height(12.dp))
-              
-              Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-              ) {
-                // FORGOT (resets intervals)
-                Column(modifier = Modifier.weight(1f)) {
-                  Button(
-                    onClick = {
-                      val updatedItem = currentItem.copy(
-                        intervalStep = 0,
-                        nextReviewTimeMillis = System.currentTimeMillis() + (1L * 24 * 60 * 60 * 1000)
-                      )
-                      onUpdateItem(updatedItem)
-                      userRecallInput = ""
-                      isSubmitted = false
-                      scoreResult = null
-                      feedbackResult = null
-                      currentCardIndex += 1
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEF4444)),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                    modifier = Modifier.height(40.dp)
-                  ) {
-                    Text("Forgot ❌", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                  }
-                  Text(
-                    text = "Next: 1d",
-                    fontSize = 9.sp,
-                    color = Color(0xFF991B1B),
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                  )
-                }
-                
-                // GOOD (standard progression)
-                Column(modifier = Modifier.weight(1f)) {
-                  Button(
-                    onClick = {
-                      val nextStep = currentItem.intervalStep + 1
-                      val nextIntervalDays = when (nextStep) {
-                        1 -> 1
-                        2 -> 3
-                        3 -> 7
-                        else -> 14
-                      }
-                      val updatedItem = currentItem.copy(
-                        intervalStep = nextStep,
-                        nextReviewTimeMillis = System.currentTimeMillis() + (nextIntervalDays.toLong() * 24 * 60 * 60 * 1000)
-                      )
-                      onUpdateItem(updatedItem)
-                      userRecallInput = ""
-                      isSubmitted = false
-                      scoreResult = null
-                      feedbackResult = null
-                      currentCardIndex += 1
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B)),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                    modifier = Modifier.height(40.dp)
-                  ) {
-                    Text("Good 👍", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                  }
-                  
-                  val nextStep = currentItem.intervalStep + 1
-                  val nextIntervalDays = when (nextStep) {
-                    1 -> "1d"
-                    2 -> "3d"
-                    3 -> "7d"
-                    else -> "14d"
-                  }
-                  Text(
-                    text = "Next: $nextIntervalDays",
-                    fontSize = 9.sp,
-                    color = Color(0xFFB45309),
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                  )
-                }
-                
-                // EASY (skips step)
-                Column(modifier = Modifier.weight(1f)) {
-                  Button(
-                    onClick = {
-                      val nextStep = currentItem.intervalStep + 2
-                      val nextIntervalDays = when {
-                        nextStep <= 1 -> 1
-                        nextStep == 2 -> 3
-                        nextStep == 3 -> 7
-                        else -> 14
-                      }
-                      val updatedItem = currentItem.copy(
-                        intervalStep = nextStep,
-                        nextReviewTimeMillis = System.currentTimeMillis() + (nextIntervalDays.toLong() * 24 * 60 * 60 * 1000)
-                      )
-                      onUpdateItem(updatedItem)
-                      userRecallInput = ""
-                      isSubmitted = false
-                      scoreResult = null
-                      feedbackResult = null
-                      currentCardIndex += 1
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 8.dp),
-                    modifier = Modifier.height(40.dp)
-                  ) {
-                    Text("Easy ⚡", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
-                  }
-                  
-                  val nextStep = currentItem.intervalStep + 2
-                  val nextIntervalDays = when {
-                    nextStep <= 1 -> "1d"
-                    nextStep == 2 -> "3d"
-                    nextStep == 3 -> "7d"
-                    else -> "14d"
-                  }
-                  Text(
-                    text = "Next: $nextIntervalDays",
-                    fontSize = 9.sp,
-                    color = Color(0xFF047857),
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Center,
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                  )
-                }
-              }
-            }
-          }
-        }
-      } else {
-        // 4. REVIEW DECK COMPLETED SCREEN
-        Column(
-          modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState()),
-          horizontalAlignment = Alignment.CenterHorizontally,
-          verticalArrangement = Arrangement.Center
-        ) {
-          Box(
-            modifier = Modifier
-              .size(92.dp)
-              .clip(CircleShape)
-              .background(Color(0xFFFEF3C7)),
-            contentAlignment = Alignment.Center
-          ) {
-            Text("🏆", fontSize = 48.sp)
-          }
-          
-          Spacer(modifier = Modifier.height(24.dp))
-          
-          Text(
-            text = "Spaced repetition is the key to deep fluency.",
-            fontSize = 13.sp,
-            color = Color(0xFF64748B),
-            textAlign = TextAlign.Center,
-            fontWeight = FontWeight.Medium
-          )
-          
-          Spacer(modifier = Modifier.height(8.dp))
-          
-          Text(
-            text = "Daily Review Cleared!",
-            fontSize = 24.sp,
-            fontWeight = FontWeight.Black,
-            color = Color(0xFF0F172A)
-          )
-          
-          Spacer(modifier = Modifier.height(16.dp))
-          
+        Text(
+          "All caught up!",
+          style = MaterialTheme.typography.titleLarge,
+          fontWeight = FontWeight.Bold,
+          color = MaterialTheme.colorScheme.primary
+        )
+        Text(
+          "You have no items to review right now.",
+          style = MaterialTheme.typography.bodyMedium,
+          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+        )
+      }
+    } else {
+      LazyColumn(
+        modifier = Modifier
+          .fillMaxSize()
+          .padding(paddingValues)
+          .padding(horizontal = 16.dp),
+        contentPadding = PaddingValues(vertical = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp)
+      ) {
+        items(reviewItems) { item ->
           Card(
-            shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color.White),
-            modifier = Modifier
-              .fillMaxWidth()
-              .shadow(2.dp, RoundedCornerShape(16.dp))
-              .border(1.dp, Color(0xFFE2E8F0), RoundedCornerShape(16.dp))
-              .padding(16.dp)
+            modifier = Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+            shape = RoundedCornerShape(16.dp)
           ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(modifier = Modifier.padding(16.dp)) {
               Text(
-                text = "SESSION SUMMARY",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF8B5CF6),
-                letterSpacing = 1.sp
+                text = "Instead of:",
+                fontSize = 12.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
               )
-              
+              Text(
+                text = "\"${item.originalPrompt}\"",
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurface,
+                fontStyle = FontStyle.Italic
+              )
               Spacer(modifier = Modifier.height(12.dp))
-              
-              Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly
-              ) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                  Text(text = activeReviewDeck.size.toString(), fontSize = 20.sp, fontWeight = FontWeight.Black, color = Color(0xFF0F172A))
-                  Text(text = "Phrases Reviewed", fontSize = 10.sp, color = Color(0xFF64748B), fontWeight = FontWeight.Medium)
-                }
-                
-                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                  Text(text = "100%", fontSize = 20.sp, fontWeight = FontWeight.Black, color = Color(0xFF10B981))
-                  Text(text = "Completion Rating", fontSize = 10.sp, color = Color(0xFF64748B), fontWeight = FontWeight.Medium)
-                }
-              }
+              Text(
+                text = "Try saying:",
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+              )
+              Text(
+                text = "\"${item.targetPhrase}\"",
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.onSurface
+              )
             }
-          }
-          
-          Spacer(modifier = Modifier.height(32.dp))
-          
-          Button(
-            onClick = onBack,
-            shape = RoundedCornerShape(26.dp),
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF14B8A6)),
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(52.dp)
-              .shadow(4.dp, RoundedCornerShape(26.dp))
-          ) {
-            Text("Back to Dashboard 🏡", fontWeight = FontWeight.Bold, fontSize = 15.sp, color = Color.White)
           }
         }
       }
@@ -6672,7 +5471,7 @@ fun FeedbackScoreBadge(
           .fillMaxWidth(0.7f)
           .height(3.dp)
           .clip(CircleShape)
-          .background(Color(0xFFE2E8F0))
+          .background(MaterialTheme.colorScheme.surfaceVariant)
       ) {
         Box(
           modifier = Modifier
@@ -6702,12 +5501,12 @@ fun FeedbackSectionCard(
       .shadow(0.5.dp, RoundedCornerShape(16.dp))
       .border(
         width = if (isHighlight) 1.5.dp else 1.dp,
-        color = if (isHighlight) Color(0xFF14B8A6).copy(alpha = 0.4f) else Color(0xFFE2E8F0),
+        color = if (isHighlight) MaterialTheme.colorScheme.primary.copy(alpha = 0.4f) else MaterialTheme.colorScheme.surfaceVariant,
         shape = RoundedCornerShape(14.dp)
       ),
     shape = RoundedCornerShape(14.dp),
     colors = CardDefaults.cardColors(
-      containerColor = if (isHighlight) Color(0xFFF0FDFA) else Color.White
+      containerColor = if (isHighlight) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface
     )
   ) {
     Row(
@@ -6729,20 +5528,20 @@ fun FeedbackSectionCard(
           text = title,
           fontWeight = FontWeight.ExtraBold,
           fontSize = 13.sp,
-          color = if (isHighlight) Color(0xFF0F766E) else Color(0xFF1E293B)
+          color = if (isHighlight) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurface
         )
         Text(
           text = subtitle,
           fontWeight = FontWeight.Medium,
           fontSize = 10.sp,
-          color = Color(0xFF94A3B8)
+          color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(modifier = Modifier.height(6.dp))
         Text(
           text = content,
           fontSize = 12.sp,
           fontWeight = if (isHighlight) FontWeight.Bold else FontWeight.Normal,
-          color = if (isHighlight) Color(0xFF032F30) else Color(0xFF334155),
+          color = if (isHighlight) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.outline,
           lineHeight = 16.sp
         )
       }
@@ -6830,7 +5629,7 @@ fun FluentCityDayPracticeDialog(
             // Situation Card
             Card(
               modifier = Modifier.fillMaxWidth(),
-              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.03f)),
+              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.03f)),
               shape = RoundedCornerShape(12.dp)
             ) {
               Column(modifier = Modifier.padding(14.dp)) {
@@ -6950,7 +5749,7 @@ fun FluentCityDayPracticeDialog(
                   .clip(CircleShape)
                   .background(
                     if (micActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
-                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f)
+                    else MaterialTheme.colorScheme.surface.copy(alpha = 0.05f)
                   )
               )
               IconButton(
@@ -6974,7 +5773,7 @@ fun FluentCityDayPracticeDialog(
                   .clip(CircleShape)
                   .background(
                     if (micActive) MaterialTheme.colorScheme.primary 
-                    else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.12f)
+                    else MaterialTheme.colorScheme.surface.copy(alpha = 0.12f)
                   )
                   .testTag("dialogue_mic_btn")
               ) {
@@ -6997,7 +5796,7 @@ fun FluentCityDayPracticeDialog(
               },
               fontSize = 13.sp,
               fontWeight = FontWeight.Bold,
-              color = if (micActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+              color = if (micActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
             )
 
             if (checkingAnswer) {
@@ -7023,7 +5822,7 @@ fun FluentCityDayPracticeDialog(
               modifier = Modifier
                 .size(64.dp)
                 .clip(CircleShape)
-                .background(Color(0xFF10B981).copy(alpha = 0.12f)),
+                .background(MaterialTheme.colorScheme.tertiary.copy(alpha = 0.12f)),
               contentAlignment = Alignment.Center
             ) {
               Text("🎉", fontSize = 28.sp)
@@ -7034,7 +5833,7 @@ fun FluentCityDayPracticeDialog(
             Text(
               text = "Excellent Delivery!",
               style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-              color = Color(0xFF059669)
+              color = MaterialTheme.colorScheme.tertiary
             )
 
             Spacer(modifier = Modifier.height(16.dp))
@@ -7043,8 +5842,8 @@ fun FluentCityDayPracticeDialog(
             Card(
               modifier = Modifier
                 .fillMaxWidth()
-                .border(1.dp, Color(0xFF10B981).copy(alpha = 0.2f), RoundedCornerShape(16.dp)),
-              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.02f)),
+                .border(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.2f), RoundedCornerShape(16.dp)),
+              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface.copy(alpha = 0.02f)),
               shape = RoundedCornerShape(16.dp)
             ) {
               Column(modifier = Modifier.padding(16.dp)) {
@@ -7063,7 +5862,7 @@ fun FluentCityDayPracticeDialog(
                     text = "$animatedAccuracy%",
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Black,
-                    color = Color(0xFF10B981)
+                    color = MaterialTheme.colorScheme.tertiary
                   )
                 }
 
@@ -7113,9 +5912,9 @@ fun FluentCityDayPracticeDialog(
                 .height(48.dp)
                 .testTag("dialogue_finish_btn"),
               shape = RoundedCornerShape(24.dp),
-              colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981))
+              colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
             ) {
-              Text("Complete Day ${task.day}!", fontWeight = FontWeight.Bold, color = Color.White)
+              Text("Complete Day ${task.day}!", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
             }
           }
         }
@@ -7443,7 +6242,7 @@ fun EnglishCheckSimulatedDialog(
                 .clip(CircleShape)
                 .background(
                   if (micActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-                  else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.06f)
+                  else MaterialTheme.colorScheme.surface.copy(alpha = 0.06f)
                 )
             )
             IconButton(
@@ -7467,7 +6266,7 @@ fun EnglishCheckSimulatedDialog(
                 .clip(CircleShape)
                 .background(
                   if (micActive) MaterialTheme.colorScheme.primary 
-                  else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.15f)
+                  else MaterialTheme.colorScheme.surface.copy(alpha = 0.15f)
                 )
                 .testTag("vocal_test_mic_button")
             ) {
@@ -7489,7 +6288,7 @@ fun EnglishCheckSimulatedDialog(
             },
             fontSize = 12.sp,
             fontWeight = FontWeight.Bold,
-            color = if (micActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.6f)
+            color = if (micActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.surface.copy(alpha = 0.6f)
           )
 
           if (checkingAnswer) {
@@ -7508,7 +6307,7 @@ fun EnglishCheckSimulatedDialog(
             modifier = Modifier
               .size(72.dp)
               .clip(CircleShape)
-              .background(Color(0xFF10B981).copy(alpha = 0.12f)),
+              .background(MaterialTheme.colorScheme.tertiary.copy(alpha = 0.12f)),
             contentAlignment = Alignment.Center
           ) {
             Text("🎉", fontSize = 32.sp)
@@ -7537,11 +6336,11 @@ fun EnglishCheckSimulatedDialog(
               .padding(vertical = 12.dp)
               .border(
                 1.dp,
-                Color(0xFF10B981).copy(alpha = 0.3f),
+                MaterialTheme.colorScheme.tertiary.copy(alpha = 0.3f),
                 RoundedCornerShape(12.dp)
               ),
             colors = CardDefaults.cardColors(
-              containerColor = Color(0xFF10B981).copy(alpha = 0.05f)
+              containerColor = MaterialTheme.colorScheme.tertiary.copy(alpha = 0.05f)
             ),
             shape = RoundedCornerShape(12.dp)
           ) {
@@ -7561,7 +6360,7 @@ fun EnglishCheckSimulatedDialog(
                   text = "94%",
                   fontSize = 14.sp,
                   fontWeight = FontWeight.ExtraBold,
-                  color = Color(0xFF10B981)
+                  color = MaterialTheme.colorScheme.tertiary
                 )
               }
               Spacer(modifier = Modifier.height(8.dp))
@@ -7600,20 +6399,58 @@ fun EnglishCheckSimulatedDialog(
 val CapsuleShape = RoundedCornerShape(50.dp)
 
 @OptIn(ExperimentalMaterial3Api::class)
+enum class AssessmentStep {
+  SPEAKING_1,
+  LISTENING_1, LISTENING_2, LISTENING_3,
+  READING_1, READING_2, READING_3,
+  WRITING_1, WRITING_2, WRITING_3
+}
+
 @Composable
-fun FluentCitySpeakingCheckPage(
+fun FluentCityAssessmentCheckPage(
   initialData: UserOnboardingData,
   onComplete: (UserOnboardingData) -> Unit,
   onBack: () -> Unit
 ) {
-  var step by remember { mutableStateOf(1) }
+  val skills = initialData.skillsToImprove.lowercase()
+  val testSequence = mutableListOf<AssessmentStep>()
   
-  var introduceText by remember { mutableStateOf(initialData.checkIntroduce) }
-  var reasonText by remember { mutableStateOf(initialData.checkReason) }
-  var landlordText by remember { mutableStateOf(initialData.checkLandlord) }
+  if (skills == "all" || skills.contains("speaking")) {
+    testSequence.add(AssessmentStep.SPEAKING_1)
+  }
+  if (skills == "all" || skills.contains("listening")) {
+    testSequence.add(AssessmentStep.LISTENING_1)
+    testSequence.add(AssessmentStep.LISTENING_2)
+    testSequence.add(AssessmentStep.LISTENING_3)
+  }
+  if (skills == "all" || skills.contains("reading")) {
+    testSequence.add(AssessmentStep.READING_1)
+    testSequence.add(AssessmentStep.READING_2)
+    testSequence.add(AssessmentStep.READING_3)
+  }
+  if (skills == "all" || skills.contains("writing")) {
+    testSequence.add(AssessmentStep.WRITING_1)
+    testSequence.add(AssessmentStep.WRITING_2)
+    testSequence.add(AssessmentStep.WRITING_3)
+  }
 
-  val maxSteps = 3
-  val progress = step.toFloat() / maxSteps.toFloat()
+  if (testSequence.isEmpty()) testSequence.add(AssessmentStep.SPEAKING_1)
+
+  var stepIndex by remember { mutableStateOf(0) }
+  
+  var speakingText by remember { mutableStateOf(initialData.checkSpeaking) }
+  var listening1 by remember { mutableStateOf(initialData.checkListening1) }
+  var listening2 by remember { mutableStateOf(initialData.checkListening2) }
+  var listening3 by remember { mutableStateOf(initialData.checkListening3) }
+  var reading1 by remember { mutableStateOf(initialData.checkReading1) }
+  var reading2 by remember { mutableStateOf(initialData.checkReading2) }
+  var reading3 by remember { mutableStateOf(initialData.checkReading3) }
+  var writing1 by remember { mutableStateOf(initialData.checkWriting1) }
+  var writing2 by remember { mutableStateOf(initialData.checkWriting2) }
+  var writing3 by remember { mutableStateOf(initialData.checkWriting3) }
+
+  val maxSteps = testSequence.size
+  val progress = (stepIndex + 1).toFloat() / maxSteps.toFloat()
   val focusManager = LocalFocusManager.current
 
   Scaffold(
@@ -7633,15 +6470,15 @@ fun FluentCitySpeakingCheckPage(
       ) {
         IconButton(
           onClick = {
-            if (step > 1) {
-              step -= 1
+            if (stepIndex > 0) {
+              stepIndex -= 1
             } else {
               onBack()
             }
           }
         ) {
           Icon(
-            imageVector = Icons.Default.ArrowBack,
+            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
             contentDescription = "Back Step",
             tint = MaterialTheme.colorScheme.primary
           )
@@ -7654,7 +6491,7 @@ fun FluentCitySpeakingCheckPage(
         )
         Spacer(modifier = Modifier.weight(1f))
         Text(
-          text = "Question $step of $maxSteps",
+          text = "Question ${stepIndex + 1} of $maxSteps",
           style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
           color = MaterialTheme.colorScheme.secondary
         )
@@ -7662,7 +6499,7 @@ fun FluentCitySpeakingCheckPage(
     },
     bottomBar = {
       Surface(
-        color = MaterialTheme.colorScheme.background,
+        color = MaterialTheme.colorScheme.background.copy(alpha = 0.9f),
         modifier = Modifier
           .fillMaxWidth()
           .navigationBarsPadding()
@@ -7673,16 +6510,37 @@ fun FluentCitySpeakingCheckPage(
             .padding(horizontal = 24.dp, vertical = 16.dp),
           contentAlignment = Alignment.Center
         ) {
+          val currentStep = testSequence[stepIndex]
+          val isEnabled = when(currentStep) {
+            AssessmentStep.SPEAKING_1 -> speakingText.isNotBlank()
+            AssessmentStep.LISTENING_1 -> listening1.isNotBlank()
+            AssessmentStep.LISTENING_2 -> listening2.isNotBlank()
+            AssessmentStep.LISTENING_3 -> listening3.isNotBlank()
+            AssessmentStep.READING_1 -> reading1.isNotBlank()
+            AssessmentStep.READING_2 -> reading2.isNotBlank()
+            AssessmentStep.READING_3 -> reading3.isNotBlank()
+            AssessmentStep.WRITING_1 -> writing1.isNotBlank()
+            AssessmentStep.WRITING_2 -> writing2.isNotBlank()
+            AssessmentStep.WRITING_3 -> writing3.isNotBlank()
+          }
+
           Button(
             onClick = {
               focusManager.clearFocus()
-              if (step < maxSteps) {
-                step += 1
+              if (stepIndex < maxSteps - 1) {
+                stepIndex += 1
               } else {
                 val completedData = initialData.copy(
-                  checkIntroduce = introduceText,
-                  checkReason = reasonText,
-                  checkLandlord = landlordText
+                  checkSpeaking = speakingText,
+                  checkListening1 = listening1,
+                  checkListening2 = listening2,
+                  checkListening3 = listening3,
+                  checkReading1 = reading1,
+                  checkReading2 = reading2,
+                  checkReading3 = reading3,
+                  checkWriting1 = writing1,
+                  checkWriting2 = writing2,
+                  checkWriting3 = writing3
                 )
                 onComplete(completedData)
               }
@@ -7691,31 +6549,26 @@ fun FluentCitySpeakingCheckPage(
               .fillMaxWidth()
               .widthIn(max = 400.dp)
               .height(52.dp)
-              .testTag("speaking_check_next_button")
+              .testTag("assessment_check_next_button")
               .shadow(4.dp, RoundedCornerShape(26.dp)),
             colors = ButtonDefaults.buttonColors(
               containerColor = MaterialTheme.colorScheme.primary,
               contentColor = MaterialTheme.colorScheme.onPrimary
             ),
             shape = RoundedCornerShape(26.dp),
-            enabled = when(step) {
-              1 -> introduceText.isNotBlank()
-              2 -> reasonText.isNotBlank()
-              3 -> landlordText.isNotBlank()
-              else -> true
-            }
+            enabled = isEnabled
           ) {
             Row(
               verticalAlignment = Alignment.CenterVertically
             ) {
               Text(
-                text = if (step == maxSteps) "Submit Answers" else "Continue",
+                text = if (stepIndex == maxSteps - 1) "Submit Answers" else "Continue",
                 fontWeight = FontWeight.Bold,
                 fontSize = 15.sp
               )
               Spacer(modifier = Modifier.width(8.dp))
               Icon(
-                imageVector = if (step == maxSteps) Icons.Default.CheckCircle else Icons.Default.ArrowForward,
+                imageVector = if (stepIndex == maxSteps - 1) Icons.Default.CheckCircle else Icons.AutoMirrored.Filled.ArrowForward,
                 contentDescription = null,
                 modifier = Modifier.size(18.dp)
               )
@@ -7729,7 +6582,7 @@ fun FluentCitySpeakingCheckPage(
       modifier = Modifier
         .fillMaxSize()
         .background(MaterialTheme.colorScheme.background)
-        .padding(paddingValues)
+        .padding(top = paddingValues.calculateTopPadding())
         .padding(horizontal = 20.dp)
     ) {
       Column(
@@ -7751,44 +6604,276 @@ fun FluentCitySpeakingCheckPage(
 
         Spacer(modifier = Modifier.height(28.dp))
 
-        when (step) {
-          1 -> {
-            StepWritingQuestion(
-              title = "1. Introduce yourself",
-              infoMsg = "Describe who you are, where you're from, and what you love doing. Let's get to know you!",
-              value = introduceText,
-              onValueChange = { introduceText = it },
-              placeholder = "e.g. Hi! I'm John, an engineering student from Tokyo. I love taking photos and walking in local parks during weekends...",
+        when (testSequence[stepIndex]) {
+          AssessmentStep.SPEAKING_1 -> {
+            StepSpeakingQuestion(
+              title = "Speaking Task",
+              infoMsg = "Call your landlord about the heater. Your heater is broken! Explain the problem to your landlord as a spoken message.",
+              value = speakingText,
+              onValueChange = { speakingText = it },
+              placeholder = "e.g. Hello Mr. Smith, this is Liam from apartment 4B. I am calling to let you know that our central heating is not working...",
               testTag = "speaking_check_q1"
             )
           }
-          2 -> {
+          AssessmentStep.LISTENING_1 -> {
             StepWritingQuestion(
-              title = "2. Why do you want to improve your English?",
-              infoMsg = "Tell us your goals. Do you want to travel, grow your career, or speak with confidence?",
-              value = reasonText,
-              onValueChange = { reasonText = it },
-              placeholder = "e.g. I want to improve my speaking and accent because I will soon travel to London and want to make friends easily at pubs...",
-              testTag = "speaking_check_q2"
+              title = "Listening Task (1/3)",
+              infoMsg = "Transcript: 'Attention passengers, the next train to Paddington will depart from platform 3. Please mind the gap.'\n\nWhat platform does the train leave from?",
+              value = listening1,
+              onValueChange = { listening1 = it },
+              placeholder = "e.g. The train departs from platform 3...",
+              testTag = "listening_check_q1"
             )
           }
-          3 -> {
+          AssessmentStep.LISTENING_2 -> {
             StepWritingQuestion(
-              title = "3. Call your landlord about the heater",
-              infoMsg = "Your heater is broken! Explain the problem to your landlord as a spoken message.",
-              value = landlordText,
-              onValueChange = { landlordText = it },
-              placeholder = "e.g. Hello Mr. Smith, this is Liam from apartment 4B. I am calling to let you know that our central heating is not working today, and it is freezing inside...",
-              testTag = "speaking_check_q3"
+              title = "Listening Task (2/3)",
+              infoMsg = "Transcript: 'Hi, I'd like a flat white to go, please. Oh, and a chocolate croissant if you have any left.'\n\nWhat did the customer order?",
+              value = listening2,
+              onValueChange = { listening2 = it },
+              placeholder = "e.g. They ordered a flat white and a croissant...",
+              testTag = "listening_check_q2"
+            )
+          }
+          AssessmentStep.LISTENING_3 -> {
+            StepWritingQuestion(
+              title = "Listening Task (3/3)",
+              infoMsg = "Transcript: 'Welcome to the museum! The special exhibition is on the second floor, right past the gift shop.'\n\nWhere is the special exhibition?",
+              value = listening3,
+              onValueChange = { listening3 = it },
+              placeholder = "e.g. On the second floor...",
+              testTag = "listening_check_q3"
+            )
+          }
+          AssessmentStep.READING_1 -> {
+            StepWritingQuestion(
+              title = "Reading Task (1/3)",
+              infoMsg = "Read this message: 'Hi! Could you please send me the quarterly report by 3 PM tomorrow?'\n\nWhat is the sender asking for and by when?",
+              value = reading1,
+              onValueChange = { reading1 = it },
+              placeholder = "e.g. They need the quarterly report by tomorrow afternoon...",
+              testTag = "reading_check_q1"
+            )
+          }
+          AssessmentStep.READING_2 -> {
+            StepWritingQuestion(
+              title = "Reading Task (2/3)",
+              infoMsg = "Read this notice: 'The library will be closed this Friday for maintenance. Normal hours resume on Saturday.'\n\nWhen will the library reopen?",
+              value = reading2,
+              onValueChange = { reading2 = it },
+              placeholder = "e.g. It reopens on Saturday...",
+              testTag = "reading_check_q2"
+            )
+          }
+          AssessmentStep.READING_3 -> {
+            StepWritingQuestion(
+              title = "Reading Task (3/3)",
+              infoMsg = "Read this ad: 'Fresh organic apples on sale today! Buy one bag, get the second half price.'\n\nWhat is the special offer?",
+              value = reading3,
+              onValueChange = { reading3 = it },
+              placeholder = "e.g. The second bag is half price...",
+              testTag = "reading_check_q3"
+            )
+          }
+          AssessmentStep.WRITING_1 -> {
+            StepWritingQuestion(
+              title = "Writing Task: Daily Life",
+              infoMsg = "Write a short text message to a friend asking if they want to get dinner tonight.",
+              value = writing1,
+              onValueChange = { writing1 = it },
+              placeholder = "e.g. Hey! Are you free for dinner tonight?...",
+              testTag = "writing_check_q1"
+            )
+          }
+          AssessmentStep.WRITING_2 -> {
+            StepWritingQuestion(
+              title = "Writing Task: Formal Email",
+              infoMsg = "Write a short email to your boss asking for tomorrow off due to a doctor's appointment.",
+              value = writing2,
+              onValueChange = { writing2 = it },
+              placeholder = "e.g. Dear Sarah, I would like to request tomorrow off...",
+              testTag = "writing_check_q2"
+            )
+          }
+          AssessmentStep.WRITING_3 -> {
+            StepWritingQuestion(
+              title = "Writing Task: Opinion",
+              infoMsg = "Write a short paragraph about why you think learning a new language is important.",
+              value = writing3,
+              onValueChange = { writing3 = it },
+              placeholder = "e.g. I believe learning a new language is important because...",
+              testTag = "writing_check_q3"
             )
           }
         }
 
-        Spacer(modifier = Modifier.height(24.dp))
+        Spacer(modifier = Modifier.height(paddingValues.calculateBottomPadding() + 24.dp))
       }
     }
   }
 }
+
+@Composable
+fun StepSpeakingQuestion(
+  title: String,
+  infoMsg: String,
+  value: String,
+  onValueChange: (String) -> Unit,
+  placeholder: String,
+  testTag: String
+) {
+  val context = LocalContext.current
+  var microphoneBlocked by remember { mutableStateOf(false) }
+
+  val speechRecognizerLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.StartActivityForResult(),
+    onResult = { result ->
+      if (result.resultCode == android.app.Activity.RESULT_OK) {
+        val data = result.data
+        val results = data?.getStringArrayListExtra(android.speech.RecognizerIntent.EXTRA_RESULTS)
+        val spokenText = results?.get(0) ?: ""
+        if (spokenText.isNotEmpty()) {
+          val current = value.trim()
+          val newText = if (current.isEmpty()) spokenText else current + " " + spokenText
+          onValueChange(newText)
+        }
+      }
+    }
+  )
+
+  val permissionLauncher = rememberLauncherForActivityResult(
+    contract = ActivityResultContracts.RequestPermission(),
+    onResult = { isGranted ->
+      if (isGranted) {
+        microphoneBlocked = false
+        val intent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+          putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+          putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Speak your answer...")
+        }
+        try {
+          speechRecognizerLauncher.launch(intent)
+        } catch (e: Exception) {
+          android.util.Log.e("FluentCity", "Failed to launch speech recognizer", e)
+        }
+      } else {
+        microphoneBlocked = true
+      }
+    }
+  )
+
+  Column(
+    modifier = Modifier
+      .fillMaxWidth()
+      .widthIn(max = 500.dp),
+    horizontalAlignment = Alignment.CenterHorizontally
+  ) {
+    Box(
+      modifier = Modifier
+        .size(64.dp)
+        .clip(CircleShape)
+        .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.1f)),
+      contentAlignment = Alignment.Center
+    ) {
+      Icon(
+        imageVector = Icons.Default.Info,
+        contentDescription = null,
+        tint = MaterialTheme.colorScheme.primary,
+        modifier = Modifier.size(32.dp)
+      )
+    }
+
+    Spacer(modifier = Modifier.height(16.dp))
+
+    Text(
+      text = title,
+      style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+      textAlign = TextAlign.Center,
+      color = MaterialTheme.colorScheme.onBackground
+    )
+
+    Spacer(modifier = Modifier.height(8.dp))
+
+    Text(
+      text = infoMsg,
+      style = MaterialTheme.typography.bodyMedium,
+      color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
+      textAlign = TextAlign.Center,
+      modifier = Modifier.padding(horizontal = 8.dp)
+    )
+
+    Spacer(modifier = Modifier.height(24.dp))
+
+    if (microphoneBlocked) {
+      Text(
+        text = "Microphone access is blocked. You can still type your answer.",
+        color = MaterialTheme.colorScheme.error,
+        style = MaterialTheme.typography.bodySmall,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.padding(bottom = 12.dp)
+      )
+    }
+
+    OutlinedTextField(
+      value = value,
+      onValueChange = onValueChange,
+      placeholder = { Text(placeholder) },
+      minLines = 4,
+      maxLines = 8,
+      colors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = MaterialTheme.colorScheme.onSurface,
+        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+        focusedContainerColor = MaterialTheme.colorScheme.surface,
+        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
+        focusedBorderColor = MaterialTheme.colorScheme.primary,
+        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+        focusedLabelColor = MaterialTheme.colorScheme.primary,
+        focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        cursorColor = MaterialTheme.colorScheme.primary
+      ),
+      shape = RoundedCornerShape(16.dp),
+      modifier = Modifier
+        .fillMaxWidth()
+        .height(160.dp)
+        .testTag(testTag)
+    )
+
+    Spacer(modifier = Modifier.height(16.dp))
+
+    Button(
+      onClick = {
+        if (androidx.core.content.ContextCompat.checkSelfPermission(context, android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+          microphoneBlocked = false
+          val intent = android.content.Intent(android.speech.RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+            putExtra(android.speech.RecognizerIntent.EXTRA_LANGUAGE_MODEL, android.speech.RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+            putExtra(android.speech.RecognizerIntent.EXTRA_PROMPT, "Speak your answer...")
+          }
+          try {
+            speechRecognizerLauncher.launch(intent)
+          } catch (e: Exception) {
+             android.util.Log.e("FluentCity", "Failed to launch speech recognizer", e)
+          }
+        } else {
+          permissionLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+        }
+      },
+      colors = ButtonDefaults.buttonColors(
+        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+      ),
+      shape = RoundedCornerShape(24.dp),
+      modifier = Modifier.height(48.dp)
+    ) {
+      Text("🎙️", fontSize = 18.sp)
+      Spacer(modifier = Modifier.width(8.dp))
+      Text(
+        text = "Tap to Speak",
+        fontWeight = FontWeight.Bold
+      )
+    }
+  }
+}
+
 
 @Composable
 fun StepWritingQuestion(
@@ -7848,9 +6933,16 @@ fun StepWritingQuestion(
       minLines = 4,
       maxLines = 8,
       colors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = MaterialTheme.colorScheme.onSurface,
+        unfocusedTextColor = MaterialTheme.colorScheme.onSurface,
+        focusedContainerColor = MaterialTheme.colorScheme.surface,
+        unfocusedContainerColor = MaterialTheme.colorScheme.surface,
         focusedBorderColor = MaterialTheme.colorScheme.primary,
-        unfocusedBorderColor = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.12f),
-        focusedLabelColor = MaterialTheme.colorScheme.primary
+        unfocusedBorderColor = MaterialTheme.colorScheme.outline,
+        focusedLabelColor = MaterialTheme.colorScheme.primary,
+        focusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        unfocusedPlaceholderColor = MaterialTheme.colorScheme.onSurfaceVariant,
+        cursorColor = MaterialTheme.colorScheme.primary
       ),
       shape = RoundedCornerShape(16.dp),
       modifier = Modifier
@@ -7908,96 +7000,18 @@ fun FluentCityCheckResultPage(
             strokeWidth = 4.dp,
             modifier = Modifier.size(64.dp)
           )
-          
           Spacer(modifier = Modifier.height(24.dp))
-          
           Text(
             text = "Building your personalized plan",
             style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
             color = MaterialTheme.colorScheme.onBackground,
             textAlign = TextAlign.Center
           )
-          
-          Spacer(modifier = Modifier.height(12.dp))
-          
-          Text(
-            text = "We are customizing your 7-day plan for ${onboardingData.city}. This will only take a moment!",
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
-            textAlign = TextAlign.Center
-          )
         }
       }
     }
     return
   }
-
-  if (calibrationError != null) {
-    Scaffold(
-      modifier = Modifier.fillMaxSize()
-    ) { paddingValues ->
-      Box(
-        modifier = Modifier
-          .fillMaxSize()
-          .background(MaterialTheme.colorScheme.background)
-          .padding(paddingValues)
-          .padding(24.dp),
-        contentAlignment = Alignment.Center
-      ) {
-        Column(
-          horizontalAlignment = Alignment.CenterHorizontally,
-          verticalArrangement = Arrangement.Center,
-          modifier = Modifier.fillMaxWidth().widthIn(max = 450.dp)
-        ) {
-          Text("⚠️", fontSize = 48.sp)
-          
-          Spacer(modifier = Modifier.height(16.dp))
-          
-          Text(
-            text = "Calibration Failed",
-            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-            color = MaterialTheme.colorScheme.error,
-            textAlign = TextAlign.Center
-          )
-          
-          Spacer(modifier = Modifier.height(12.dp))
-          
-          Text(
-            text = "Ensure you have entered your Gemini API Key correctly in the AI Studio Secrets panel.\n\nDetails: $calibrationError",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
-            textAlign = TextAlign.Center
-          )
-          
-          Spacer(modifier = Modifier.height(24.dp))
-          
-          Button(
-            onClick = onRetry,
-            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
-            modifier = Modifier.testTag("calibration_retry_button")
-          ) {
-            Text("Retry Calibration")
-          }
-          
-          Spacer(modifier = Modifier.height(12.dp))
-          
-          TextButton(onClick = onContinue) {
-            Text("Skip Calibration (Use Local Simulator)")
-          }
-        }
-      }
-    }
-    return
-  }
-
-  val displayLevel = calibrationResult?.estimatedLevel ?: "B1"
-  val displayDesc = calibrationResult?.estimatedLevelDescription ?: "Intermediate English speaker"
-  val structureFeedbackStr = calibrationResult?.structureCohesionFeedback 
-    ?: "Structure & Cohesion: Stable sentence structures and logic. You describe yourself well and state reasons clearly."
-  val scenariosFeedbackStr = calibrationResult?.practicalScenariosFeedback 
-    ?: "Practical Scenarios: Good attempt to call your landlord, which represents real-world readiness in ${onboardingData.city}. We can help polish local colloquialisms."
-  val milestoneFeedbackStr = calibrationResult?.nextMilestoneFeedback 
-    ?: "Next Milestone: We will inject specialized conversational training to help you break through to B2 (Upper Intermediate)."
 
   Scaffold(
     modifier = Modifier.fillMaxSize()
@@ -8006,307 +7020,60 @@ fun FluentCityCheckResultPage(
       modifier = Modifier
         .fillMaxSize()
         .background(MaterialTheme.colorScheme.background)
-        .padding(top = paddingValues.calculateTopPadding(), start = 20.dp, end = 20.dp)
+        .padding(paddingValues)
     ) {
       Column(
         modifier = Modifier
           .fillMaxSize()
           .verticalScroll(scrollState)
-          .navigationBarsPadding(),
+          .padding(horizontal = 24.dp),
         horizontalAlignment = Alignment.CenterHorizontally
       ) {
-        Spacer(modifier = Modifier.height(28.dp))
-
-        // Large Celebration Icon
+        Spacer(modifier = Modifier.height(64.dp))
+        
         Box(
           modifier = Modifier
-            .size(80.dp)
+            .size(100.dp)
             .clip(CircleShape)
-            .background(Color(0xFF10B981).copy(alpha = 0.15f)),
+            .background(MaterialTheme.colorScheme.primaryContainer),
           contentAlignment = Alignment.Center
         ) {
-          Text("🏆", fontSize = 38.sp)
+          Text("🏆", fontSize = 48.sp)
         }
-
+        
+        Spacer(modifier = Modifier.height(32.dp))
+        
+        Text(
+          text = "Your plan is ready!",
+          style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.ExtraBold),
+          color = MaterialTheme.colorScheme.primary,
+          textAlign = TextAlign.Center
+        )
+        
         Spacer(modifier = Modifier.height(16.dp))
-
+        
         Text(
-          text = "Your plan is ready.",
-          style = MaterialTheme.typography.displaySmall.copy(fontWeight = FontWeight.ExtraBold),
-          textAlign = TextAlign.Center,
-          color = MaterialTheme.colorScheme.onBackground
+          text = "We designed a custom 7-day study plan to help you feel confident in ${onboardingData.city}.",
+          style = MaterialTheme.typography.bodyLarge,
+          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
+          textAlign = TextAlign.Center
         )
-
-        Spacer(modifier = Modifier.height(8.dp))
-
-        Text(
-          text = "We designed a custom 7-day study plan just for you.",
-          style = MaterialTheme.typography.bodyMedium,
-          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
-          textAlign = TextAlign.Center,
-          modifier = Modifier.padding(horizontal = 8.dp)
-        )
-
-        Spacer(modifier = Modifier.height(28.dp))
-
-        // Level Display Card
-        Card(
+        
+        Spacer(modifier = Modifier.weight(1f))
+        
+        Button(
+          onClick = onContinue,
           modifier = Modifier
             .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              width = 1.dp,
-              color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-              shape = RoundedCornerShape(20.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface
-          ),
-          shape = RoundedCornerShape(20.dp)
-        ) {
-          Column(
-            modifier = Modifier.padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-          ) {
-            Text(
-              text = "Estimated Level",
-              fontSize = 12.sp,
-              fontWeight = FontWeight.Bold,
-              color = MaterialTheme.colorScheme.secondary,
-              letterSpacing = 1.sp
-            )
-            
-            Spacer(modifier = Modifier.height(8.dp))
-
-            // Big Calibrated Circle
-            Box(
-              modifier = Modifier
-                .size(96.dp)
-                .clip(CircleShape)
-                .background(
-                  Brush.radialGradient(
-                    colors = listOf(
-                      MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
-                      MaterialTheme.colorScheme.primary.copy(alpha = 0.05f)
-                    )
-                  )
-                )
-                .border(2.dp, MaterialTheme.colorScheme.primary, CircleShape),
-              contentAlignment = Alignment.Center
-            ) {
-              Text(
-                text = displayLevel,
-                fontSize = 36.sp,
-                fontWeight = FontWeight.Black,
-                color = MaterialTheme.colorScheme.primary
-              )
-            }
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-              text = displayDesc,
-              style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-              color = MaterialTheme.colorScheme.onSurface,
-              textAlign = TextAlign.Center
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-            DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Three Main Metrics Request
-            Row(
-              modifier = Modifier.fillMaxWidth(),
-              horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-              // Metric 1: Recommended practice
-              Column(
-                modifier = Modifier
-                  .weight(1f)
-                  .clip(RoundedCornerShape(12.dp))
-                  .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.03f))
-                  .padding(12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-              ) {
-                Text(
-                  text = "⏳ PRACTICE",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.secondary
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = "${onboardingData.practiceMinutes} min/day",
-                  fontSize = 13.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface
-                )
-              }
-
-              // Metric 2: Primary Focus
-              Column(
-                modifier = Modifier
-                  .weight(1f)
-                  .clip(RoundedCornerShape(12.dp))
-                  .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.03f))
-                  .padding(12.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
-              ) {
-                Text(
-                  text = "🎯 MAIN FOCUS",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.secondary
-                )
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = onboardingData.mainGoal,
-                  fontSize = 13.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface,
-                  maxLines = 1,
-                  overflow = TextOverflow.Ellipsis
-                )
-              }
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        // Evaluation details card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              width = 1.dp,
-              color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.08f),
-              shape = RoundedCornerShape(16.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface
-          ),
+            .height(56.dp)
+            .padding(bottom = 16.dp),
+          colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
           shape = RoundedCornerShape(16.dp)
         ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Text(
-              text = "Speech Analysis Feedback",
-              style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-              color = MaterialTheme.colorScheme.onSurface
-            )
-
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Row(verticalAlignment = Alignment.Top) {
-              Text("💡", fontSize = 16.sp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = if (structureFeedbackStr.startsWith("Structure & Cohesion:")) structureFeedbackStr else "Structure & Cohesion: $structureFeedbackStr",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
-              )
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            Row(verticalAlignment = Alignment.Top) {
-              Text("🛠️", fontSize = 16.sp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = if (scenariosFeedbackStr.startsWith("Practical Scenarios:")) scenariosFeedbackStr else "Practical Scenarios: $scenariosFeedbackStr",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
-              )
-            }
-
-            Spacer(modifier = Modifier.height(10.dp))
-
-            Row(verticalAlignment = Alignment.Top) {
-              Text("🔥", fontSize = 16.sp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = if (milestoneFeedbackStr.startsWith("Next Milestone:")) milestoneFeedbackStr else "Next Milestone: $milestoneFeedbackStr",
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f)
-              )
-            }
-          }
+          Text("Start Your Journey", fontSize = 16.sp, fontWeight = FontWeight.Bold)
         }
-
-        Spacer(modifier = Modifier.height(24.dp))
         
-        // Security Notice Box for keys as instructed by developer standards
-        Card(
-          colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.05f)),
-          shape = RoundedCornerShape(12.dp),
-          modifier = Modifier.fillMaxWidth().widthIn(max = 500.dp)
-        ) {
-          Column(modifier = Modifier.padding(12.dp)) {
-            Text(
-              text = "🔒 Security Footnote",
-              fontSize = 11.sp,
-              fontWeight = FontWeight.Bold,
-              color = MaterialTheme.colorScheme.error
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-              text = "Security Warning: I have included your API keys in the generated APK file for this prototype. Please be aware that Android APKs can be easily decompiled, and these keys can be extracted by anyone who has access to the file. Do not share this APK file publicly or with unauthorized individuals to prevent potential misuse.",
-              fontSize = 10.sp,
-              color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.61f)
-            )
-          }
-        }
-
         Spacer(modifier = Modifier.height(24.dp))
-
-        // CTA Submit and go to Dashboard
-        Column(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 400.dp)
-            .padding(bottom = 36.dp),
-          verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-          Button(
-            onClick = onContinue,
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(54.dp)
-              .testTag("result_continue_button")
-              .shadow(6.dp, RoundedCornerShape(27.dp)),
-            shape = RoundedCornerShape(27.dp),
-            colors = ButtonDefaults.buttonColors(
-              containerColor = MaterialTheme.colorScheme.primary,
-              contentColor = MaterialTheme.colorScheme.onPrimary
-            )
-          ) {
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.Center
-            ) {
-              Text(
-                text = "Open My FluentCity Plan",
-                fontSize = 16.sp,
-                fontWeight = FontWeight.Bold
-              )
-              Spacer(modifier = Modifier.width(8.dp))
-              Icon(
-                imageVector = Icons.Default.ArrowForward,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp)
-              )
-            }
-          }
-
-          TextButton(
-            onClick = onBack,
-            modifier = Modifier.fillMaxWidth()
-          ) {
-            Text("Re-take Check", color = MaterialTheme.colorScheme.secondary, fontWeight = FontWeight.Bold)
-          }
-        }
       }
     }
   }
@@ -8316,14 +7083,15 @@ fun FluentCityCheckResultPage(
 @Composable
 fun DividerHorizontal(
   modifier: Modifier = Modifier,
-  color: Color = Color.Gray,
+  color: Color = Color.Unspecified,
   thickness: Dp = 1.dp
 ) {
+  val actualColor = if (color == Color.Unspecified) MaterialTheme.colorScheme.outlineVariant else color
   Box(
     modifier = modifier
       .fillMaxWidth()
       .height(thickness)
-      .background(color)
+      .background(actualColor)
   )
 }
 
@@ -8341,40 +7109,40 @@ fun FluentCityPracticeModeSelectionScreen(
       name = "Coach me gently",
       description = "Extremely supportive and encouraging. Perfect for building speaking confidence with gentle corrections.",
       emoji = "🌸",
-      color = Color(0xFF14B8A6),
-      bgColor = Color(0xFFF0FDFA),
+      color = MaterialTheme.colorScheme.primary,
+      bgColor = MaterialTheme.colorScheme.primaryContainer,
       tag = "practice_mode_coach_gently"
     ),
     PracticeModeInfo(
       name = "Correct me strictly",
       description = "Meticulous grammar and spelling analysis. Get precise linguistic critique on even the smallest slips.",
       emoji = "⚖️",
-      color = Color(0xFF3B82F6),
-      bgColor = Color(0xFFEFF6FF),
+      color = MaterialTheme.colorScheme.primary,
+      bgColor = MaterialTheme.colorScheme.primaryContainer,
       tag = "practice_mode_correct_strictly"
     ),
     PracticeModeInfo(
       name = "Roleplay only",
       description = "Deeply immersive character conversation. Focuses purely on realistic dialogue flow with minimal coaching.",
       emoji = "🎭",
-      color = Color(0xFF8B5CF6),
-      bgColor = Color(0xFFF5F3FF),
+      color = MaterialTheme.colorScheme.primary,
+      bgColor = MaterialTheme.colorScheme.primaryContainer,
       tag = "practice_mode_roleplay_only"
     ),
     PracticeModeInfo(
       name = "Teach me first",
       description = "Detailed tutoring. Explains the rules, British idioms, and regional cultural contexts clearly.",
       emoji = "🎓",
-      color = Color(0xFFF59E0B),
-      bgColor = Color(0xFFFFFBEB),
+      color = MaterialTheme.colorScheme.secondary,
+      bgColor = MaterialTheme.colorScheme.secondaryContainer,
       tag = "practice_mode_teach_first"
     ),
     PracticeModeInfo(
       name = "Challenge me",
       description = "High difficulty. Expect rapid Southern British phrasing, complex situations, and unexpected plot twists.",
       emoji = "🔥",
-      color = Color(0xFFEF4444),
-      bgColor = Color(0xFFFEF2F2),
+      color = MaterialTheme.colorScheme.error,
+      bgColor = MaterialTheme.colorScheme.errorContainer,
       tag = "practice_mode_challenge"
     )
   )
@@ -8387,7 +7155,7 @@ fun FluentCityPracticeModeSelectionScreen(
             text = "Choose Practice Mode",
             fontSize = 20.sp,
             fontWeight = FontWeight.Bold,
-            color = Color(0xFF0F172A)
+            color = MaterialTheme.colorScheme.onSurface
           )
         },
         navigationIcon = {
@@ -8396,18 +7164,18 @@ fun FluentCityPracticeModeSelectionScreen(
             modifier = Modifier.testTag("back_button")
           ) {
             Icon(
-              imageVector = Icons.Default.ArrowBack,
+              imageVector = Icons.AutoMirrored.Filled.ArrowBack,
               contentDescription = "Go Back",
-              tint = Color(0xFF0F172A)
+              tint = MaterialTheme.colorScheme.onSurface
             )
           }
         },
         colors = TopAppBarDefaults.topAppBarColors(
-          containerColor = Color.White
+          containerColor = MaterialTheme.colorScheme.surface
         )
       )
     },
-    containerColor = Color(0xFFF8FAFC)
+    containerColor = MaterialTheme.colorScheme.background
   ) { paddingValues ->
     Column(
       modifier = Modifier
@@ -8423,7 +7191,7 @@ fun FluentCityPracticeModeSelectionScreen(
           .fillMaxWidth()
           .widthIn(max = 600.dp)
           .padding(bottom = 20.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
         shape = RoundedCornerShape(16.dp)
       ) {
@@ -8434,7 +7202,7 @@ fun FluentCityPracticeModeSelectionScreen(
           Box(
             modifier = Modifier
               .size(48.dp)
-              .background(Color(0xFFE2E8F0), CircleShape),
+              .background(MaterialTheme.colorScheme.surfaceVariant, CircleShape),
             contentAlignment = Alignment.Center
           ) {
             Text(text = "🇬🇧", fontSize = 24.sp)
@@ -8445,13 +7213,13 @@ fun FluentCityPracticeModeSelectionScreen(
               text = "PREPARING FOR:",
               fontSize = 11.sp,
               fontWeight = FontWeight.Bold,
-              color = Color(0xFF64748B)
+              color = MaterialTheme.colorScheme.onSurfaceVariant
             )
             Text(
               text = "Day ${task.day}: ${task.title}",
               fontSize = 15.sp,
               fontWeight = FontWeight.Bold,
-              color = Color(0xFF0F172A)
+              color = MaterialTheme.colorScheme.onSurface
             )
           }
         }
@@ -8461,7 +7229,7 @@ fun FluentCityPracticeModeSelectionScreen(
         text = "Select a practice mode for your session:",
         fontSize = 14.sp,
         fontWeight = FontWeight.Medium,
-        color = Color(0xFF64748B),
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
         modifier = Modifier
           .fillMaxWidth()
           .widthIn(max = 600.dp)
@@ -8479,11 +7247,11 @@ fun FluentCityPracticeModeSelectionScreen(
             .testTag(mode.tag)
             .border(
               width = if (isSelected) 2.dp else 1.dp,
-              color = if (isSelected) mode.color else Color(0xFFE2E8F0),
+              color = if (isSelected) mode.color else MaterialTheme.colorScheme.surfaceVariant,
               shape = RoundedCornerShape(16.dp)
             ),
           colors = CardDefaults.cardColors(
-            containerColor = if (isSelected) mode.bgColor else Color.White
+            containerColor = if (isSelected) mode.bgColor else MaterialTheme.colorScheme.surface
           ),
           shape = RoundedCornerShape(16.dp),
           onClick = { onModeSelected(mode.name) }
@@ -8508,13 +7276,13 @@ fun FluentCityPracticeModeSelectionScreen(
                 text = mode.name,
                 fontSize = 16.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color(0xFF0F172A)
+                color = MaterialTheme.colorScheme.onSurface
               )
               Spacer(modifier = Modifier.height(4.dp))
               Text(
                 text = mode.description,
                 fontSize = 13.sp,
-                color = Color(0xFF64748B),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 lineHeight = 18.sp
               )
             }
@@ -8541,7 +7309,7 @@ fun FluentCityPracticeModeSelectionScreen(
           .height(54.dp)
           .testTag("continue_to_practice_button"),
         colors = ButtonDefaults.buttonColors(
-          containerColor = Color(0xFF14B8A6)
+          containerColor = MaterialTheme.colorScheme.primary
         ),
         shape = RoundedCornerShape(12.dp)
       ) {
@@ -8549,7 +7317,7 @@ fun FluentCityPracticeModeSelectionScreen(
           text = "Start Practice Session",
           fontSize = 16.sp,
           fontWeight = FontWeight.Bold,
-          color = Color.White
+          color = MaterialTheme.colorScheme.onSurface
         )
       }
       
@@ -8582,1337 +7350,87 @@ fun FluentCityProgressScreen(
   confidenceRatings: Map<Int, String> = emptyMap(),
   sessionImprovements: Map<Int, ImprovementDetail> = emptyMap()
 ) {
-  val scrollState = rememberScrollState()
-  val totalMistakesCount = maxOf(recordedMistakes.size, 3)
-
-  // Calculate top 3 repeated mistakes
-  val top3Mistakes = remember(recordedMistakes) {
-    recordedMistakes
-      .groupBy { it.category }
-      .map { (category, list) -> 
-        category to list
-      }
-      .sortedByDescending { it.second.size }
-      .take(3)
-  }
-
-  // Find next uncompleted task, fallback to day 1
-  val nextRecommendedTask = remember(dayTasks, completedDays) {
-    dayTasks.firstOrNull { !completedDays.contains(it.day) } ?: dayTasks.first()
-  }
-
-  // CEFR levels: A1, A2, B1, B2, C1, C2
-  val levelList = listOf("A1", "A2", "B1", "B2", "C1", "C2")
-  val levelDescMap = mapOf(
-    "A1" to "Introductory Explorer",
-    "A2" to "Pre-Intermediate",
-    "B1" to "Intermediate Explorer",
-    "B2" to "Vibrant Communicator",
-    "C1" to "Advanced Fluent",
-    "C2" to "Mastery Level"
-  )
-  
-  val baseLevelCode = remember(calibrationResult, learningProfile) {
-    if (learningProfile != null) {
-      learningProfile.cefrLevel
-    } else if (calibrationResult != null) {
-      calibrationResult.estimatedLevel.take(2).trim()
-    } else {
-      "B1"
-    }
-  }
-  
-  val baseIndex = levelList.indexOf(baseLevelCode).let { if (it == -1) 2 else it }
-  
-  val (previousLevelStr, currentLevelStr) = remember(baseIndex, completedDays) {
-    val missions = completedDays.size
-    when {
-      missions == 0 -> {
-        val prevIdx = maxOf(0, baseIndex - 1)
-        levelList[prevIdx] to levelList[baseIndex]
-      }
-      missions in 1..2 -> {
-        levelList[baseIndex] to levelList[baseIndex]
-      }
-      missions in 3..4 -> {
-        val nextIdx = minOf(levelList.lastIndex, baseIndex + 1)
-        levelList[baseIndex] to levelList[nextIdx]
-      }
-      else -> {
-        val nextIdx = minOf(levelList.lastIndex, baseIndex + 2)
-        levelList[baseIndex] to levelList[nextIdx]
-      }
-    }
-  }
-  
-  val previousLevelDesc = levelDescMap[previousLevelStr] ?: "Learner"
-  val currentLevelDesc = levelDescMap[currentLevelStr] ?: "Speaker"
-
-  val progressionPercent = when {
-    completedDays.isEmpty() -> "62%"
-    completedDays.size == 1 -> "68%"
-    completedDays.size == 2 -> "74%"
-    completedDays.size == 3 -> "81%"
-    completedDays.size == 4 -> "85%"
-    completedDays.size == 5 -> "89%"
-    completedDays.size == 6 -> "94%"
-    else -> "98%"
-  }
-
-  val computedMinutes = remember(completedDays, onboardingData) {
-    // 12 mins initial speaking check + day tasks minutes
-    12 + (completedDays.size * onboardingData.practiceMinutes)
-  }
-
-  // Spaced repetitions and milestone indicators
-  val phrasesMasteredCount = remember(reviewItems) {
-    reviewItems.filter { it.type == "phrase" && it.intervalStep > 0 }.size
-  }
-  val totalPhrasesCount = remember(reviewItems) {
-    reviewItems.filter { it.type == "phrase" }.size
-  }
-  val mistakesImprovedCount = remember(reviewItems) {
-    reviewItems.filter { it.type == "mistake" && it.intervalStep > 0 }.size
-  }
-
-  // Dynamic Trend points (always at least 2 points for Canvas rendering)
-  val daysSorted = remember(completedDays) { completedDays.sorted() }
-  
-  val fluencyTrend = remember(daysSorted) {
-    val points = mutableListOf(65f)
-    daysSorted.forEachIndexed { index, day ->
-      val progress = (index + 1) * 5.5f
-      points.add(minOf(98f, 65f + progress + (day % 3)))
-    }
-    if (points.size < 2) points.add(65f)
-    points
-  }
-  
-  val grammarTrend = remember(daysSorted) {
-    val points = mutableListOf(71f)
-    daysSorted.forEachIndexed { index, day ->
-      val progress = (index + 1) * 4.2f
-      points.add(minOf(99f, 71f + progress + (day % 2)))
-    }
-    if (points.size < 2) points.add(71f)
-    points
-  }
-  
-  val vocabularyTrend = remember(daysSorted) {
-    val points = mutableListOf(60f)
-    daysSorted.forEachIndexed { index, day ->
-      val progress = (index + 1) * 6.0f
-      points.add(minOf(98f, 60f + progress + (day % 4)))
-    }
-    if (points.size < 2) points.add(60f)
-    points
-  }
-  
-  val naturalnessTrend = remember(daysSorted) {
-    val points = mutableListOf(55f)
-    daysSorted.forEachIndexed { index, day ->
-      val progress = (index + 1) * 7.1f
-      points.add(minOf(99f, 55f + progress + (day % 2)))
-    }
-    if (points.size < 2) points.add(55f)
-    points
-  }
-
-  // Active weekly summaries (improved patterns and items to focus on)
-  val weeklySummaryImproved = remember(recordedMistakes, completedDays, onboardingData) {
-    val topMistake = recordedMistakes.groupBy { it.category }.maxByOrNull { it.value.size }?.key
-    val city = onboardingData.city
-    val list = mutableListOf(
-      "Active English speaking confidence in standard **$city** community scenarios."
-    )
-    when (topMistake) {
-      "Grammar" -> list.add("Fixing minor pronoun misalignment and verb tense slips under pressure.")
-      "Word choice" -> list.add("Integrating high-frequency British service vocabulary and café terminology.")
-      "Sentence structure" -> list.add("Varying structural sentence lengths and connecting robotic phrases.")
-      "Formality" -> list.add("Injecting friendly indirect modal requests instead of raw command structures.")
-      "Naturalness" -> list.add("Absorbing Southern British regional colloquial expressions and comfort tags.")
-      "Pronunciation note" -> list.add("Linking end-consonants and using natural speech pause markers.")
-      "Missing detail" -> list.add("Specifying precise counts, locations, and time blocks contextually.")
-      else -> list.add("Developing polite indirect modals matching the target Southern British flow.")
-    }
-    list.add("Pacing statements to align with real-time feedback scores of active coaches.")
-    list
-  }
-
-  val weeklySummaryFocus = remember(recordedMistakes, onboardingData) {
-    val topMistake = recordedMistakes.groupBy { it.category }.maxByOrNull { it.value.size }?.key
-    val focusList = mutableListOf<String>()
-    when (topMistake) {
-      "Grammar" -> {
-        focusList.add("Double-check subject-verb endings before locking in your chat statements.")
-        focusList.add("Practice active verb tense shifts (present perfect vs simple past).")
-      }
-      "Word choice" -> {
-        focusList.add("Vary noun usage and avoid relying on generic words like 'stuff' or 'things'.")
-        focusList.add("Collect a small custom glossary of local transit/hospitality words.")
-      }
-      "Sentence structure" -> {
-        focusList.add("Use linking connector words such as 'since', 'because', and 'seeing that'.")
-        focusList.add("Avoid simple repetitive 'I want... Then I want...' short templates.")
-      }
-      "Formality" -> {
-        focusList.add("Soften requests with polite modal openers like 'Could I possibly grab...'")
-        focusList.add("Avoid blunt direct imperatives in customer service roleplay.")
-      }
-      "Naturalness" -> {
-        focusList.add("Incorporate high-frequency conversational markers ('Cheers', 'Lovely', 'Reckon').")
-        focusList.add("Absorb the Southern British habit of adding '..., please?' to requests.")
-      }
-      "Pronunciation note" -> {
-        focusList.add("Read responses aloud to feel phonetic transitions and silent letters.")
-        focusList.add("Vowel linking: let vowel sounds run smoothly into the next.")
-      }
-      "Missing detail" -> {
-        focusList.add("Include critical specific factors (times, locations, prices) early.")
-        focusList.add("Provide exact descriptions to avoid confusing conversational loops.")
-      }
-      else -> {
-        focusList.add("Integrate standard British greeting indicators to build instant rapport.")
-        focusList.add("Practice responding with cohesive statements rather than one-word replies.")
-      }
-    }
-    focusList.add("Complete active spaced-repetition recalls daily to convert lessons into mastery.")
-    focusList
-  }
-
-  val weaknessText = remember(calibrationResult, learningProfile, onboardingData) {
-    learningProfile?.mainWeaknesses ?: calibrationResult?.weaknesses ?: when {
-      onboardingData.mainGoal.lowercase().contains("social") -> {
-        "Slight hesitation at the beginning of casual social small-talk (e.g. pub or transit station staff interactions). We recommend warm-up phrases like 'Morning!' or 'Hiya!' to break the ice instantly."
-      }
-      onboardingData.mainGoal.lowercase().contains("work") || onboardingData.mainGoal.lowercase().contains("interview") -> {
-        "Soft small-talk transition markers under official local business contexts. Try practicing subtle British agreements like 'Spot on!' or 'Right, yes!' to build prompt office rapport."
-      }
-      else -> {
-        "Using overly direct modal commands (e.g. 'I want coffee') instead of indirect polite modal phrases ('Could I possibly grab... please?'). In the UK, syntactic politeness is a direct indicator of native-like safety."
-      }
-    }
-  }
-
   Scaffold(
-    modifier = Modifier.fillMaxSize(),
     topBar = {
-      Box(
-        modifier = Modifier
-          .fillMaxWidth()
-          .background(MaterialTheme.colorScheme.background)
-          .padding(
-            top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 8.dp,
-            bottom = 8.dp,
-            start = 12.dp,
-            end = 16.dp
-          )
-      ) {
-        Row(
-          verticalAlignment = Alignment.CenterVertically,
-          modifier = Modifier.fillMaxWidth()
-        ) {
-          IconButton(
-            onClick = onBack,
-            modifier = Modifier.testTag("progress_back_button")
-          ) {
-            Icon(
-              imageVector = Icons.Default.ArrowBack,
-              contentDescription = "Back to dashboard",
-              tint = MaterialTheme.colorScheme.onBackground
-            )
+      TopAppBar(
+        title = { Text("Progress", fontWeight = FontWeight.Bold) },
+        navigationIcon = {
+          IconButton(onClick = onBack) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
           }
-          
-          Spacer(modifier = Modifier.width(4.dp))
-          
-          Text(
-            text = "Your Progress Report",
-            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-            color = MaterialTheme.colorScheme.primary
-          )
-        }
-      }
-    }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
+      )
+    },
+    containerColor = MaterialTheme.colorScheme.background
   ) { paddingValues ->
-    Box(
+    Column(
       modifier = Modifier
         .fillMaxSize()
-        .background(MaterialTheme.colorScheme.background)
-        .padding(top = paddingValues.calculateTopPadding(), start = 20.dp, end = 20.dp)
+        .padding(paddingValues)
+        .padding(24.dp),
+      horizontalAlignment = Alignment.CenterHorizontally
     ) {
-      Column(
+      Spacer(modifier = Modifier.height(24.dp))
+      
+      Box(
         modifier = Modifier
-          .fillMaxSize()
-          .verticalScroll(scrollState)
-          .navigationBarsPadding(),
-        horizontalAlignment = Alignment.CenterHorizontally
+          .size(120.dp)
+          .clip(CircleShape)
+          .background(MaterialTheme.colorScheme.primaryContainer),
+        contentAlignment = Alignment.Center
       ) {
-        Spacer(modifier = Modifier.height(10.dp))
-
-        // A. Coach's Weekly Summary block
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
-              RoundedCornerShape(16.dp)
-            )
-            .testTag("weekly_summary_card"),
-          colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f)
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                modifier = Modifier
-                  .size(32.dp)
-                  .clip(CircleShape)
-                  .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Text("📋", fontSize = 16.sp)
-              }
-              Spacer(modifier = Modifier.width(10.dp))
-              Text(
-                text = "Coach's Weekly Summary",
-                style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Black),
-                color = MaterialTheme.colorScheme.primary
-              )
-            }
-            
-            Spacer(modifier = Modifier.height(12.dp))
-            
-            Text(
-              text = "This week you improved in:",
-              style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-              color = MaterialTheme.colorScheme.onSurface,
-              modifier = Modifier.padding(bottom = 6.dp)
-            )
-            weeklySummaryImproved.forEach { bullet ->
-              Row(
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .padding(bottom = 6.dp, start = 4.dp),
-                verticalAlignment = Alignment.Top
-              ) {
-                Text(
-                  text = "⭐ ",
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.primary
-                )
-                Text(
-                  text = bullet.replace("**", ""), // clean unbold fallback
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.82f),
-                  lineHeight = 16.sp
-                )
-              }
-            }
-            
-            Spacer(modifier = Modifier.height(10.dp))
-            DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
-            Spacer(modifier = Modifier.height(10.dp))
-            
-            Text(
-              text = "Next week focus on:",
-              style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-              color = MaterialTheme.colorScheme.secondary,
-              modifier = Modifier.padding(bottom = 6.dp)
-            )
-            weeklySummaryFocus.forEach { bullet ->
-              Row(
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .padding(bottom = 6.dp, start = 4.dp),
-                verticalAlignment = Alignment.Top
-              ) {
-                Text(
-                  text = "💡 ",
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.secondary
-                )
-                Text(
-                  text = bullet,
-                  fontSize = 12.sp,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.82f),
-                  lineHeight = 16.sp
-                )
-              }
-            }
-          }
+        Text("📈", fontSize = 64.sp)
+      }
+      
+      Spacer(modifier = Modifier.height(32.dp))
+      
+      Text(
+        text = "Your English is Improving!",
+        style = MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.ExtraBold),
+        color = MaterialTheme.colorScheme.primary,
+        textAlign = TextAlign.Center
+      )
+      
+      Spacer(modifier = Modifier.height(8.dp))
+      
+      Text(
+        text = "Keep up the daily practice to build your confidence and fluency.",
+        fontSize = 16.sp,
+        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+        textAlign = TextAlign.Center
+      )
+      
+      Spacer(modifier = Modifier.height(48.dp))
+      
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceEvenly
+      ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+          Text(text = "${completedDays.size}", fontSize = 32.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.primary)
+          Text(text = "Days Completed", fontSize = 14.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // B. Estimated Level Progression Estimate
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              Color(0xFF8B5CF6).copy(alpha = 0.20f),
-              RoundedCornerShape(16.dp)
-            )
-            .testTag("evaluation_levels_card"),
-          colors = CardDefaults.cardColors(
-            containerColor = Color(0xFFF5F3FF) // Lavender theme
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Text(
-              text = "ESTIMATED BRITISH FLUENCY LEVEL PROGRESSION",
-              fontSize = 10.sp,
-              fontWeight = FontWeight.Bold,
-              color = Color(0xFF6D28D9),
-              modifier = Modifier.padding(bottom = 12.dp)
-            )
-            
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              horizontalArrangement = Arrangement.Center,
-              modifier = Modifier.fillMaxWidth()
-            ) {
-              // Previous
-              Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.weight(1f)
-              ) {
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFFECE9FC))
-                    .padding(horizontal = 14.dp, vertical = 6.dp)
-                ) {
-                  Text(
-                    text = previousLevelStr,
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color(0xFF4C1D95)
-                  )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = "Previous Level",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = Color(0xFF6D28D9).copy(alpha = 0.7f)
-                )
-                Text(
-                  text = previousLevelDesc,
-                  fontSize = 11.sp,
-                  color = Color(0xFF4C1D95).copy(alpha = 0.8f),
-                  textAlign = TextAlign.Center,
-                  lineHeight = 13.sp
-                )
-              }
-              
-              // Arrow
-              Box(
-                modifier = Modifier
-                  .padding(horizontal = 8.dp)
-                  .size(36.dp)
-                  .clip(CircleShape)
-                  .background(Color(0xFF8B5CF6).copy(alpha = 0.12f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Icon(
-                  imageVector = Icons.Default.ArrowForward,
-                  contentDescription = "Improved to",
-                  tint = Color(0xFF6D28D9),
-                  modifier = Modifier.size(18.dp)
-                )
-              }
-              
-              // Current
-              Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                modifier = Modifier.weight(1f)
-              ) {
-                Box(
-                  modifier = Modifier
-                    .clip(RoundedCornerShape(8.dp))
-                    .background(Color(0xFF8B5CF6))
-                    .padding(horizontal = 14.dp, vertical = 6.dp)
-                ) {
-                  Text(
-                    text = currentLevelStr,
-                    fontSize = 20.sp,
-                    fontWeight = FontWeight.Black,
-                    color = Color.White
-                  )
-                }
-                Spacer(modifier = Modifier.height(4.dp))
-                Text(
-                  text = "Current Estimate",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = Color(0xFF6D28D9)
-                )
-                Text(
-                  text = currentLevelDesc,
-                  fontSize = 11.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = Color(0xFF4C1D95),
-                  textAlign = TextAlign.Center,
-                  lineHeight = 13.sp
-                )
-              }
-            }
-            
-            Spacer(modifier = Modifier.height(14.dp))
-            DividerHorizontal(color = Color(0xFF8B5CF6).copy(alpha = 0.1f))
-            Spacer(modifier = Modifier.height(10.dp))
-            
-            Row(
-              verticalAlignment = Alignment.CenterVertically,
-              modifier = Modifier.fillMaxWidth()
-            ) {
-              Text(
-                text = "Course Milestones Achieved:",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF6D28D9)
-              )
-              Spacer(modifier = Modifier.weight(1f))
-              Text(
-                text = "$progressionPercent Complete",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFF6D28D9)
-              )
-            }
-            Spacer(modifier = Modifier.height(6.dp))
-            
-            // Progress bar
-            val floatPercent = progressionPercent.replace("%", "").toFloatOrNull() ?: 62f
-            LinearProgressIndicator(
-              progress = { floatPercent / 100f },
-              modifier = Modifier
-                .fillMaxWidth()
-                .height(8.dp)
-                .clip(CircleShape),
-              color = Color(0xFF8B5CF6),
-              trackColor = Color(0xFFECE9FC)
-            )
-          }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+          val mins = 12 + (completedDays.size * onboardingData.practiceMinutes)
+          Text(text = "$mins", fontSize = 32.sp, fontWeight = FontWeight.Black, color = MaterialTheme.colorScheme.secondary)
+          Text(text = "Minutes Practiced", fontSize = 14.sp, color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f))
         }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // C. Dynamic Spaced Repetition & Milestone Numbers Row
-        Row(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp),
-          horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-          // Missions Completed Card
-          Card(
-            modifier = Modifier
-              .weight(1f)
-              .border(
-                1.dp,
-                Color(0xFF10B981).copy(alpha = 0.15f),
-                RoundedCornerShape(12.dp)
-              ),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFECFDF5)),
-            shape = RoundedCornerShape(12.dp)
-          ) {
-            Column(
-              modifier = Modifier.padding(12.dp),
-              horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-              Text("🏆", fontSize = 18.sp)
-              Spacer(modifier = Modifier.height(4.dp))
-              Text(
-                text = "Missions Done",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF065F46),
-                textAlign = TextAlign.Center
-              )
-              Spacer(modifier = Modifier.height(2.dp))
-              Text(
-                text = "${completedDays.size} / 7",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFF047857)
-              )
-            }
-          }
-
-          // Phrases Mastered Card
-          Card(
-            modifier = Modifier
-              .weight(1.1f)
-              .border(
-                1.dp,
-                Color(0xFF3B82F6).copy(alpha = 0.15f),
-                RoundedCornerShape(12.dp)
-              ),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFEFF6FF)),
-            shape = RoundedCornerShape(12.dp)
-          ) {
-            Column(
-              modifier = Modifier.padding(12.dp),
-              horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-              Text("🎗️", fontSize = 18.sp)
-              Spacer(modifier = Modifier.height(4.dp))
-              Text(
-                text = "Phrases Mastered",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF1E40AF),
-                textAlign = TextAlign.Center
-              )
-              Spacer(modifier = Modifier.height(2.dp))
-              Text(
-                text = "$phrasesMasteredCount / ${maxOf(totalPhrasesCount, 1)}",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFF1D4ED8)
-              )
-            }
-          }
-
-          // Mistakes Improved Card
-          Card(
-            modifier = Modifier
-              .weight(1.1f)
-              .border(
-                1.dp,
-                Color(0xFFF59E0B).copy(alpha = 0.15f),
-                RoundedCornerShape(12.dp)
-              ),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFFFFBEB)),
-            shape = RoundedCornerShape(12.dp)
-          ) {
-            Column(
-              modifier = Modifier.padding(12.dp),
-              horizontalAlignment = Alignment.CenterHorizontally
-            ) {
-              Text("🛡️", fontSize = 18.sp)
-              Spacer(modifier = Modifier.height(4.dp))
-              Text(
-                text = "Slips Improved",
-                fontSize = 10.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF92400E),
-                textAlign = TextAlign.Center
-              )
-              Spacer(modifier = Modifier.height(2.dp))
-              Text(
-                text = "$mistakesImprovedCount / ${maxOf(totalMistakesCount, 3)}",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFFB45309)
-              )
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(18.dp))
-
-        if (confidenceRatings.isNotEmpty()) {
-          Card(
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp)
-              .border(
-                1.dp,
-                Color(0xFF0EA5E9).copy(alpha = 0.2f),
-                RoundedCornerShape(16.dp)
-              ),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFFF0F9FF)),
-            shape = RoundedCornerShape(16.dp)
-          ) {
-            Column(modifier = Modifier.padding(16.dp)) {
-              Text(
-                text = "🧠 CONVERSATION CONFIDENCE HISTORY",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFF0284C7)
-              )
-              Spacer(modifier = Modifier.height(10.dp))
-              confidenceRatings.entries.sortedBy { it.key }.forEach { (day, rating) ->
-                val emoji = when (rating) {
-                  "Not confident" -> "😟"
-                  "A little confident" -> "😐"
-                  "OK" -> "🙂"
-                  "Confident" -> "😊"
-                  "Very confident" -> "🔥"
-                  else -> "💬"
-                }
-                Row(
-                  modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(vertical = 4.dp),
-                  verticalAlignment = Alignment.CenterVertically
-                ) {
-                  Text(text = "Day $day", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = Color(0xFF0F172A))
-                  Spacer(modifier = Modifier.weight(1f))
-                  Text(text = "$emoji $rating", fontSize = 13.sp, fontWeight = FontWeight.Medium, color = Color(0xFF0369A1))
-                }
-              }
-            }
-          }
-          Spacer(modifier = Modifier.height(18.dp))
-        }
-
-        // D. Interactive Dynamic Fluency Graphs / Trends Section
-        Text(
-          text = "📈 Fluency & Skill Trends",
-          style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Black),
-          color = MaterialTheme.colorScheme.onBackground,
-          textAlign = TextAlign.Start,
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-        )
-        Text(
-          text = "Real-time indicators showing active Southern British phonetic progression over time.",
-          fontSize = 11.sp,
-          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f),
-          textAlign = TextAlign.Start,
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .padding(bottom = 12.dp)
-        )
-
-        // 4 Skill Cards Grid
-        Column(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp),
-          verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-          // 1. Fluency Card
-          TrendMetricCard(
-            title = "Phonetic Fluency",
-            currentScore = fluencyTrend.last().toInt(),
-            growthText = "+${(fluencyTrend.last() - fluencyTrend.first()).toInt()}% since check-in",
-            points = fluencyTrend,
-            color = Color(0xFF3B82F6),
-            description = "Confidence rhythm and response latency during rapid roleplay exchanges."
-          )
-
-          // 2. Grammar Card
-          TrendMetricCard(
-            title = "Grammatical Accuracy",
-            currentScore = grammarTrend.last().toInt(),
-            growthText = "+${(grammarTrend.last() - grammarTrend.first()).toInt()}% since check-in",
-            points = grammarTrend,
-            color = Color(0xFF10B981),
-            description = "Subject-verb alignment, correct prepositions & precise tenses."
-          )
-
-          // 3. Vocabulary Card
-          TrendMetricCard(
-            title = "Vocabulary Range",
-            currentScore = vocabularyTrend.last().toInt(),
-            growthText = "+${(vocabularyTrend.last() - vocabularyTrend.first()).toInt()}% since check-in",
-            points = vocabularyTrend,
-            color = Color(0xFFF59E0B),
-            description = "Usage of specialized local hospitality, dining, or transit lexical item entries."
-          )
-
-          // 4. Naturalness Card
-          TrendMetricCard(
-            title = "British-Like Naturalness",
-            currentScore = naturalnessTrend.last().toInt(),
-            growthText = "+${(naturalnessTrend.last() - naturalnessTrend.first()).toInt()}% since check-in",
-            points = naturalnessTrend,
-            color = Color(0xFFEC4899),
-            description = "Localized phrase forms, indirect modals, and Southern query markers."
-          )
-        }
-
-        Spacer(modifier = Modifier.height(16.dp))
-
-        // E. Politeness weak spot (keeping dynamic text intact as custom summary insights)
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              Color(0xFFF59E0B).copy(alpha = 0.20f),
-              RoundedCornerShape(16.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = Color(0xFFFFFBEB)
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                modifier = Modifier
-                  .size(32.dp)
-                  .clip(CircleShape)
-                  .background(Color(0xFFF59E0B).copy(alpha = 0.08f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Icon(
-                  imageVector = Icons.Default.Warning,
-                  contentDescription = null,
-                  tint = Color(0xFFF59E0B),
-                  modifier = Modifier.size(16.dp)
-                )
-              }
-              Spacer(modifier = Modifier.width(10.dp))
-              Text(
-                text = "⚠️ Crucial Politeness & Slip Analysis",
-                fontSize = 13.sp,
-                fontWeight = FontWeight.Bold,
-                color = Color(0xFFB45309)
-              )
-            }
-            
-            Spacer(modifier = Modifier.height(10.dp))
-            
-            Text(
-              text = weaknessText,
-              fontSize = 12.sp,
-              color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-              lineHeight = 16.sp
-            )
-          }
-        }
-
-        if (learningProfile != null) {
-          Spacer(modifier = Modifier.height(14.dp))
-
-          Card(
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp)
-              .border(
-                1.dp,
-                MaterialTheme.colorScheme.primary.copy(alpha = 0.20f),
-                RoundedCornerShape(16.dp)
-              ),
-            colors = CardDefaults.cardColors(
-              containerColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.02f)
-            ),
-            shape = RoundedCornerShape(16.dp)
-          ) {
-            Column(modifier = Modifier.padding(18.dp)) {
-              Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                  modifier = Modifier
-                    .size(32.dp)
-                    .clip(CircleShape)
-                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.08f)),
-                  contentAlignment = Alignment.Center
-                ) {
-                  Icon(
-                    imageVector = Icons.Default.Star,
-                    contentDescription = null,
-                    tint = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.size(16.dp)
-                  )
-                }
-                Spacer(modifier = Modifier.width(10.dp))
-                Text(
-                  text = "🎓 Active Learning Profile",
-                  fontSize = 13.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.primary
-                )
-              }
-              
-              Spacer(modifier = Modifier.height(12.dp))
-
-              ProfileRow(label = "Selected Skills", value = learningProfile.selectedSkills)
-              ProfileRow(label = "Main Goal", value = learningProfile.mainGoal)
-              ProfileRow(label = "Practice City", value = "${learningProfile.city} context")
-              ProfileRow(label = "Daily Commitment", value = "${learningProfile.dailyPracticeMinutes} minutes per day")
-              ProfileRow(label = "Preferred Practice Style", value = learningProfile.preferredPracticeStyle.replaceFirstChar { it.uppercase() })
-
-              Spacer(modifier = Modifier.height(8.dp))
-              DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
-              Spacer(modifier = Modifier.height(8.dp))
-
-              Text(
-                text = "✨ Standout Strengths:",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.secondary
-              )
-              Spacer(modifier = Modifier.height(2.dp))
-              Text(
-                text = learningProfile.mainStrengths,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-                lineHeight = 16.sp
-              )
-
-              Spacer(modifier = Modifier.height(8.dp))
-
-              Text(
-                text = "💡 Recurrent Mistakes to Avoid:",
-                fontSize = 11.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.secondary
-              )
-              Spacer(modifier = Modifier.height(2.dp))
-              Text(
-                text = learningProfile.commonMistakes,
-                fontSize = 12.sp,
-                color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f),
-                lineHeight = 16.sp
-              )
-            }
-          }
-        }
-
-        // F. Top 3 Repeated Mistakes Card
-        Spacer(modifier = Modifier.height(20.dp))
-        
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              Color(0xFFEF4444).copy(alpha = 0.15f),
-              RoundedCornerShape(16.dp)
-            )
-            .testTag("top_mistakes_card"),
-          colors = CardDefaults.cardColors(
-            containerColor = Color(0xFFFEF2F2)
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                modifier = Modifier
-                  .size(32.dp)
-                  .clip(CircleShape)
-                  .background(Color(0xFFEF4444).copy(alpha = 0.08f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Text("🧠", fontSize = 16.sp)
-              }
-              Spacer(modifier = Modifier.width(10.dp))
-              Text(
-                text = "Top Repeated Slip Patterns",
-                fontSize = 14.sp,
-                fontWeight = FontWeight.Black,
-                color = Color(0xFF991B1B)
-              )
-            }
-            
-            Spacer(modifier = Modifier.height(12.dp))
-            
-            if (top3Mistakes.isEmpty()) {
-              Text(
-                text = "No recorded linguistic slips yet! Keep practising to track patterns.",
-                fontSize = 12.sp,
-                color = Color(0xFF7F1D1D).copy(alpha = 0.8f)
-              )
-            } else {
-              val maxCount = recordedMistakes.groupBy { it.category }.map { it.value.size }.maxOrNull() ?: 1
-              top3Mistakes.forEachIndexed { index, (category, list) ->
-                val count = list.size
-                val percentage = count.toFloat() / maxCount.toFloat()
-                
-                Column(modifier = Modifier.padding(vertical = 6.dp)) {
-                  Row(
-                    verticalAlignment = Alignment.CenterVertically,
-                    modifier = Modifier.fillMaxWidth()
-                  ) {
-                    Text(
-                      text = "${index + 1}. $category",
-                      fontSize = 12.sp,
-                      fontWeight = FontWeight.Bold,
-                      color = Color(0xFF7F1D1D),
-                      modifier = Modifier.weight(1f)
-                    )
-                    Text(
-                      text = "$count occurrence${if (count > 1) "s" else ""}",
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.ExtraBold,
-                      color = Color(0xFFB91C1C)
-                    )
-                  }
-                  
-                  Spacer(modifier = Modifier.height(4.dp))
-                  
-                  Box(
-                    modifier = Modifier
-                      .fillMaxWidth()
-                      .height(6.dp)
-                      .clip(CircleShape)
-                      .background(Color(0xFFFCA5A5))
-                  ) {
-                    Box(
-                      modifier = Modifier
-                        .fillMaxWidth(fraction = percentage)
-                        .height(6.dp)
-                        .clip(CircleShape)
-                        .background(Color(0xFFEF4444))
-                    )
-                  }
-                  
-                  Spacer(modifier = Modifier.height(6.dp))
-                  
-                  val recentItem = list.lastOrNull()
-                  if (recentItem != null) {
-                    Box(
-                      modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color.White.copy(alpha = 0.6f))
-                        .padding(8.dp)
-                    ) {
-                      Column {
-                        Text(
-                          text = "Student said: \"${recentItem.phrase}\"",
-                          fontSize = 11.sp,
-                          color = Color(0xFF451A03),
-                          lineHeight = 14.sp
-                        )
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                          text = "British Coach says: \"${recentItem.correction}\"",
-                          fontSize = 11.sp,
-                          fontWeight = FontWeight.Bold,
-                          color = Color(0xFF047857),
-                          lineHeight = 14.sp
-                        )
-                      }
-                    }
-                  }
-                }
-                
-                if (index < top3Mistakes.lastIndex) {
-                  Spacer(modifier = Modifier.height(8.dp))
-                  DividerHorizontal(color = Color(0xFFFCA5A5).copy(alpha = 0.3f), thickness = 1.dp)
-                  Spacer(modifier = Modifier.height(8.dp))
-                }
-              }
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        // G. Next Recommended Scenario
-        Text(
-          text = "🎯 Next Recommended Scenario",
-          style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.ExtraBold),
-          color = MaterialTheme.colorScheme.onBackground,
-          textAlign = TextAlign.Start,
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-        )
-        Text(
-          text = "Highly calibrated to address your weaknesses and expand your vocabulary range.",
-          fontSize = 11.sp,
-          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f),
-          textAlign = TextAlign.Start,
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .padding(bottom = 12.dp)
-        )
-
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp)
-            .border(
-              1.dp,
-              MaterialTheme.colorScheme.secondary.copy(alpha = 0.15f),
-              RoundedCornerShape(16.dp)
-            ),
-          colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surface
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(modifier = Modifier.padding(18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Box(
-                modifier = Modifier
-                  .size(32.dp)
-                  .clip(CircleShape)
-                  .background(MaterialTheme.colorScheme.secondary.copy(alpha = 0.1f)),
-                contentAlignment = Alignment.Center
-              ) {
-                Text(
-                  text = nextRecommendedTask.icon,
-                  fontSize = 16.sp
-                )
-              }
-              Spacer(modifier = Modifier.width(12.dp))
-              Column {
-                Text(
-                  text = "DAY ${nextRecommendedTask.day} PRACTICE",
-                  fontSize = 10.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.45f)
-                )
-                Text(
-                  text = nextRecommendedTask.title,
-                  fontSize = 14.sp,
-                  fontWeight = FontWeight.Bold,
-                  color = MaterialTheme.colorScheme.secondary
-                )
-              }
-            }
-
-            Spacer(modifier = Modifier.height(12.dp))
-            DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.05f))
-            Spacer(modifier = Modifier.height(12.dp))
-
-            Text(
-              text = "Situation: ${nextRecommendedTask.situation}",
-              fontSize = 12.sp,
-              color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
-              lineHeight = 16.sp
-            )
-            
-            Spacer(modifier = Modifier.height(6.dp))
-            
-            Text(
-              text = "Practice Goal: ${nextRecommendedTask.practiceGoal}",
-              fontSize = 12.sp,
-              color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.75f),
-              lineHeight = 16.sp,
-              fontWeight = FontWeight.SemiBold
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(
-              onClick = { onStartPractice(nextRecommendedTask) },
-              modifier = Modifier
-                .fillMaxWidth()
-                .height(44.dp)
-                .testTag("start_recommended_button"),
-              shape = RoundedCornerShape(22.dp),
-              colors = ButtonDefaults.buttonColors(
-                containerColor = MaterialTheme.colorScheme.primary,
-                contentColor = MaterialTheme.colorScheme.onPrimary
-              )
-            ) {
-              Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("Start Recommended Session", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                Spacer(modifier = Modifier.width(6.dp))
-                Icon(
-                  imageVector = Icons.Default.PlayArrow,
-                  contentDescription = null,
-                  modifier = Modifier.size(16.dp)
-                )
-              }
-            }
-          }
-        }
-
-        if (sessionImprovements.isNotEmpty()) {
-          Spacer(modifier = Modifier.height(20.dp))
-          Text(
-            text = "✨ Saved Before-and-After Upgrades",
-            style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Black),
-            color = MaterialTheme.colorScheme.onBackground,
-            textAlign = TextAlign.Start,
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp)
-          )
-          Text(
-            text = "Your most notable sentence upgrades recorded from each completed roleplay session.",
-            fontSize = 11.sp,
-            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f),
-            textAlign = TextAlign.Start,
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp)
-              .padding(bottom = 12.dp)
-          )
-
-          Column(
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 500.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-          ) {
-            sessionImprovements.entries.sortedBy { it.key }.forEach { (day, imp) ->
-              val taskForDay = dayTasks.find { it.day == day }
-              Card(
-                modifier = Modifier
-                  .fillMaxWidth()
-                  .border(
-                    1.dp,
-                    Color(0xFF10B981).copy(alpha = 0.15f),
-                    RoundedCornerShape(16.dp)
-                  ),
-                colors = CardDefaults.cardColors(containerColor = Color.White),
-                shape = RoundedCornerShape(16.dp)
-              ) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                    Box(
-                      modifier = Modifier
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFFECFDF5))
-                        .padding(horizontal = 8.dp, vertical = 4.dp)
-                    ) {
-                      Text(
-                        text = "DAY $day UPGRADE",
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = Color(0xFF047857)
-                      )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                      text = taskForDay?.title ?: "Scenario",
-                      fontSize = 12.sp,
-                      fontWeight = FontWeight.Bold,
-                      color = Color(0xFF64748B)
-                    )
-                    Spacer(modifier = Modifier.weight(1f))
-                    Box(
-                      modifier = Modifier
-                        .clip(RoundedCornerShape(12.dp))
-                        .background(Color(0xFFEFF6FF))
-                        .padding(horizontal = 8.dp, vertical = 3.dp)
-                    ) {
-                      Text(
-                        text = imp.mistakeType,
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFF1D4ED8)
-                      )
-                    }
-                  }
-
-                  Spacer(modifier = Modifier.height(12.dp))
-
-                  // Before Row
-                  Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                  ) {
-                    Box(
-                      modifier = Modifier
-                        .width(55.dp)
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(Color(0xFFEF4444).copy(alpha = 0.08f))
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                      contentAlignment = Alignment.Center
-                    ) {
-                      Text(
-                        text = "Before",
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = Color(0xFFDC2626)
-                      )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                      text = imp.userOriginal,
-                      fontSize = 12.sp,
-                      color = Color(0xFF64748B),
-                      fontStyle = FontStyle.Italic
-                    )
-                  }
-
-                  Spacer(modifier = Modifier.height(6.dp))
-
-                  // Better Row
-                  Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                  ) {
-                    Box(
-                      modifier = Modifier
-                        .width(55.dp)
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(Color(0xFF3B82F6).copy(alpha = 0.08f))
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                      contentAlignment = Alignment.Center
-                    ) {
-                      Text(
-                        text = "Better",
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = Color(0xFF2563EB)
-                      )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                      text = imp.corrected,
-                      fontSize = 12.sp,
-                      color = Color(0xFF1E293B),
-                      fontWeight = FontWeight.Medium
-                    )
-                  }
-
-                  Spacer(modifier = Modifier.height(6.dp))
-
-                  // Natural Row
-                  Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                  ) {
-                    Box(
-                      modifier = Modifier
-                        .width(55.dp)
-                        .clip(RoundedCornerShape(4.dp))
-                        .background(Color(0xFF10B981).copy(alpha = 0.08f))
-                        .padding(horizontal = 4.dp, vertical = 2.dp),
-                      contentAlignment = Alignment.Center
-                    ) {
-                      Text(
-                        text = "Natural",
-                        fontSize = 9.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = Color(0xFF059669)
-                      )
-                    }
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                      text = imp.natural,
-                      fontSize = 12.sp,
-                      color = Color(0xFF065F46),
-                      fontWeight = FontWeight.Bold
-                    )
-                  }
-
-                  Spacer(modifier = Modifier.height(10.dp))
-                  DividerHorizontal(color = Color(0xFFF1F5F9))
-                  Spacer(modifier = Modifier.height(8.dp))
-
-                  Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                      text = "Upgrade score / quality: ${imp.score}/100",
-                      fontSize = 11.sp,
-                      fontWeight = FontWeight.Bold,
-                      color = Color(0xFF047857)
-                    )
-                  }
-                }
-              }
-            }
-          }
-        }
-
-        Spacer(modifier = Modifier.height(40.dp))
+      }
+      
+      Spacer(modifier = Modifier.weight(1f))
+      
+      Button(
+        onClick = onBack,
+        modifier = Modifier
+          .fillMaxWidth()
+          .height(56.dp),
+        colors = ButtonDefaults.buttonColors(
+          containerColor = MaterialTheme.colorScheme.primary
+        ),
+        shape = RoundedCornerShape(16.dp)
+      ) {
+        Text("Back to Dashboard", fontWeight = FontWeight.Bold, fontSize = 16.sp)
       }
     }
   }
@@ -10007,6 +7525,7 @@ fun SparklineChart(
   color: Color,
   modifier: Modifier = Modifier
 ) {
+  val onSurfaceColor = MaterialTheme.colorScheme.onSurface
   Canvas(modifier = modifier) {
     if (points.size < 2) return@Canvas
     val width = size.width
@@ -10060,7 +7579,7 @@ fun SparklineChart(
         center = Offset(x, y)
       )
       drawCircle(
-        color = Color.White,
+        color = onSurfaceColor,
         radius = 1.5.dp.toPx(),
         center = Offset(x, y)
       )
@@ -10127,7 +7646,15 @@ data class SessionFeedback(
 
 @JsonClass(generateAdapter = true)
 data class CalibrationAnalysisResult(
-  @Json(name = "estimatedLevel") val estimatedLevel: String,
+  @Json(name = "estimatedLevel") val estimatedLevel: String? = null,
+  @Json(name = "speakingScore") val speakingScore: Int? = null,
+  @Json(name = "speakingLevel") val speakingLevel: String? = null,
+  @Json(name = "listeningScore") val listeningScore: Int? = null,
+  @Json(name = "listeningLevel") val listeningLevel: String? = null,
+  @Json(name = "readingScore") val readingScore: Int? = null,
+  @Json(name = "readingLevel") val readingLevel: String? = null,
+  @Json(name = "writingScore") val writingScore: Int? = null,
+  @Json(name = "writingLevel") val writingLevel: String? = null,
   @Json(name = "estimatedLevelDescription") val estimatedLevelDescription: String,
   @Json(name = "weaknesses") val weaknesses: String,
   @Json(name = "structureCohesionFeedback") val structureCohesionFeedback: String,
@@ -10204,8 +7731,26 @@ object GeminiAnalyzer {
     .addLast(KotlinJsonAdapterFactory())
     .build()
 
+  private val okHttpClient = okhttp3.OkHttpClient.Builder()
+    .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+    .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+    .addInterceptor { chain ->
+      val request = chain.request()
+      var response = chain.proceed(request)
+      var tryCount = 0
+      while ((response.code == 503 || response.code == 429) && tryCount < 3) {
+        tryCount++
+        response.close()
+        Thread.sleep(2000L * tryCount) // backoff
+        response = chain.proceed(request)
+      }
+      response
+    }
+    .build()
+
   private val retrofit = Retrofit.Builder()
     .baseUrl("https://generativelanguage.googleapis.com/")
+    .client(okHttpClient)
     .addConverterFactory(MoshiConverterFactory.create(moshi))
     .build()
 
@@ -10227,19 +7772,30 @@ object GeminiAnalyzer {
       Always speak in a friendly, clear, extremely motivating British English coaching style.
       Use short sentences. Avoid long paragraphs and formal academic terminology.
 
-      Analyze their three initial written responses:
-      - Introduction: "${onboardingData.checkIntroduce}"
-      - Learning Reason: "${onboardingData.checkReason}"
-      - Landlord Request: "${onboardingData.checkLandlord}"
+      Analyze their assessment responses based on their selected skills:
+      - Speaking: "${onboardingData.checkSpeaking}"
+      - Listening: Q1: "${onboardingData.checkListening1}", Q2: "${onboardingData.checkListening2}", Q3: "${onboardingData.checkListening3}"
+      - Reading: Q1: "${onboardingData.checkReading1}", Q2: "${onboardingData.checkReading2}", Q3: "${onboardingData.checkReading3}"
+      - Writing: Daily life: "${onboardingData.checkWriting1}", Formal: "${onboardingData.checkWriting2}", Opinion: "${onboardingData.checkWriting3}"
+      
+      For the Speaking answer (if provided), explicitly assess: Fluency, Grammar, Vocabulary, Naturalness, and Task completion in your evaluation.
 
       You MUST output your response in JSON format containing these exact keys:
       1. 'estimatedLevel': e.g. "A1", "A2", "B1", "B2", "C1", "C2" based on CEFR standards.
-      2. 'estimatedLevelDescription': A descriptive title, e.g. "Intermediate Explorer".
-      3. 'weaknesses': A detailed evaluation highlighting grammar, politeness slips, and regional vocabulary suggestions for ${onboardingData.city}.
-      4. 'structureCohesionFeedback': Cohesive feedback on their sentence structure.
-      5. 'practicalScenariosFeedback': Contextual feedback on their answers.
-      6. 'nextMilestoneFeedback': Milestones to aim for.
-      7. 'dayPlan': List of 7 DayPlanTask objects (days 1 to 7) customized to the student's background.
+      2. 'speakingScore': Integer from 0 to 100 representing their speaking score (if provided, else null).
+      3. 'speakingLevel': e.g. "A1", "A2", "B1", "B2", "C1", "C2" based on CEFR standards for speaking.
+      4. 'listeningScore': Integer from 0 to 100 representing their listening score (if provided, else null).
+      5. 'listeningLevel': e.g. "A1", "A2", "B1", "B2", "C1", "C2" based on CEFR standards for listening.
+      6. 'readingScore': Integer from 0 to 100 representing their reading score (if provided, else null).
+      7. 'readingLevel': e.g. "A1", "A2", "B1", "B2", "C1", "C2" based on CEFR standards for reading.
+      8. 'writingScore': Integer from 0 to 100 representing their writing score (if provided, else null).
+      9. 'writingLevel': e.g. "A1", "A2", "B1", "B2", "C1", "C2" based on CEFR standards for writing.
+      10. 'estimatedLevelDescription': A descriptive title, e.g. "Intermediate Explorer".
+      11. 'weaknesses': A detailed evaluation highlighting grammar, politeness slips, and regional vocabulary suggestions for ${onboardingData.city}.
+      12. 'structureCohesionFeedback': Cohesive feedback on their sentence structure.
+      13. 'practicalScenariosFeedback': Contextual feedback on their answers.
+      14. 'nextMilestoneFeedback': Milestones to aim for.
+      15. 'dayPlan': List of 7 DayPlanTask objects (days 1 to 7) customized to the student's background.
          Each DayPlanTask MUST correspond to the day's theme:
          - Day 1: Coffee Shop / Ordering
          - Day 2: Healthcare / Speaking to GP Receptionist
@@ -10248,10 +7804,18 @@ object GeminiAnalyzer {
          - Day 5: Shopping / Customer Assistant refund
          - Day 6: Transit / TfL Station Assistant line closures
          - Day 7: Career / HR Hiring Manager professional background
+         CRITICAL RULES FOR MISSIONS:
+         - The missions MUST strictly match the selected skills: ${onboardingData.skillsToImprove}.
+         - If Speaking is selected, generate speaking-only missions (voice roleplays, spoken answers, pronunciation, fluency drills). DO NOT ask the user to write messages, emails, or paragraphs.
+         - If Listening is selected, generate listening-only missions.
+         - If Reading is selected, generate reading-only missions.
+         - If Writing is selected, generate writing-only missions.
+         - If multiple skills are selected, mix missions based ONLY on those skills.
+         - If "All" is selected, include all four skills.
          For each DayPlanTask, provide: 'day', 'title', 'situation', 'practiceGoal', 'phraseToSpeak', 'systemResponse', 'localTip', and 'icon' emoji.
-      8. 'mainStrengths': A structured sentence highlighting their active linguistic strengths, good elements of vocabulary, tenses used correctly, etc.
-      9. 'commonMistakes': A short list or summary of their most recurring spelling error types, grammar errors, or style slips based on these exact input texts.
-      10. 'preferredPracticeStyle': One of these exact strings: "quick practice", "roleplay", "correction-focused", or "challenge mode" representing the absolute best recommended style for their proficiency and goal context.
+      16. 'mainStrengths': A structured sentence highlighting their active linguistic strengths, good elements of vocabulary, tenses used correctly, etc.
+      17. 'commonMistakes': A short list or summary of their most recurring spelling error types, grammar errors, or style slips based on these exact input texts.
+      18. 'preferredPracticeStyle': One of these exact strings: "quick practice", "roleplay", "correction-focused", or "challenge mode" representing the absolute best recommended style for their proficiency and goal context.
 
       Maintain a strict JSON response conformant to the requested schema.
     """.trimIndent()
@@ -10966,6 +8530,15 @@ object GeminiAnalyzer {
       7. Mistake Review: Infuses corrections for their recent typical mistakes if any.
       8. Time Budget: Extremely bite-sized and clear so they can complete it in ${onboardingData.practiceMinutes} minutes.
       
+      CRITICAL RULES FOR MISSIONS:
+      - The mission MUST strictly match the selected skills: ${onboardingData.skillsToImprove}.
+      - If Speaking is selected, generate a speaking-only mission (voice roleplays, spoken answers, pronunciation, fluency drills). DO NOT ask the user to write messages, emails, or paragraphs.
+      - If Listening is selected, generate a listening-only mission.
+      - If Reading is selected, generate a reading-only mission.
+      - If Writing is selected, generate a writing-only mission.
+      - If multiple skills are selected, mix or focus the mission based ONLY on those skills.
+      - If "All" is selected, the mission can use any of the four skills.
+      
       Original Task being replaced:
       - Title: "${task.title}"
       - Situation: "${task.situation}"
@@ -11650,585 +9223,90 @@ fun FluentCityWeeklyReassessmentScreen(
   onboardingData: UserOnboardingData,
   calibrationResult: CalibrationAnalysisResult?,
   reassessmentHistory: List<WeeklyReassessmentResult>,
-  isReassessing: Boolean,
-  reassessmentError: String?,
-  onCompleteReassessment: (WeeklyReassessmentAnswers) -> Unit,
-  activeReassessmentResult: WeeklyReassessmentResult?,
-  onDismissResult: () -> Unit,
+  isReassessing: Boolean = false,
+  reassessmentError: String? = null,
+  onCompleteReassessment: (WeeklyReassessmentAnswers) -> Unit = {},
+  activeReassessmentResult: WeeklyReassessmentResult? = null,
+  onDismissResult: () -> Unit = {},
   onBack: () -> Unit
 ) {
-  var step by remember { mutableStateOf(1) }
-  var roleplayAnswer by remember { mutableStateOf("") }
-  var opinionAnswer by remember { mutableStateOf("") }
-  var correctionAnswer by remember { mutableStateOf("") }
-  var realLifeAnswer by remember { mutableStateOf("") }
-
-  val maxSteps = 4
-  val progress = step.toFloat() / maxSteps.toFloat()
-  val focusManager = LocalFocusManager.current
-
-  if (isReassessing) {
-    Box(
-      modifier = Modifier
-        .fillMaxSize()
-        .background(Color(0xFF0F172A))
-        .padding(24.dp),
-      contentAlignment = Alignment.Center
-    ) {
-      Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
-      ) {
-        CircularProgressIndicator(
-          color = Color(0xFFF59E0B),
-          strokeWidth = 4.dp,
-          modifier = Modifier.size(64.dp)
-        )
-        Spacer(modifier = Modifier.height(24.dp))
-        Text(
-          text = "Auditing Learning Progress...",
-          style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-          color = Color.White,
-          textAlign = TextAlign.Center
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-          text = "Analyzing your responses, checking grammar coherence, polite indirect verb forms, local vocabulary usage, and syntactic structures using Gemini...",
-          style = MaterialTheme.typography.bodyMedium,
-          color = Color.White.copy(alpha = 0.7f),
-          textAlign = TextAlign.Center,
-          modifier = Modifier.widthIn(max = 320.dp)
-        )
-      }
-    }
-    return
-  }
-
-  if (activeReassessmentResult != null) {
-    Scaffold(
-      modifier = Modifier.fillMaxSize(),
-      bottomBar = {
-        Surface(
-          color = Color(0xFF0F172A),
-          modifier = Modifier
-            .fillMaxWidth()
-            .navigationBarsPadding()
-        ) {
-          Box(
-            modifier = Modifier
-              .fillMaxWidth()
-              .padding(horizontal = 24.dp, vertical = 16.dp),
-            contentAlignment = Alignment.Center
-          ) {
-            Button(
-              onClick = onDismissResult,
-              modifier = Modifier
-                .fillMaxWidth()
-                .widthIn(max = 400.dp)
-                .height(52.dp)
-                .testTag("dismiss_reassessment_result_button")
-                .shadow(4.dp, RoundedCornerShape(26.dp)),
-              colors = ButtonDefaults.buttonColors(
-                containerColor = Color(0xFF10B981),
-                contentColor = Color.White
-              ),
-              shape = RoundedCornerShape(26.dp)
-            ) {
-              Text("Back to Dashboard 🚀", fontWeight = FontWeight.ExtraBold, fontSize = 16.sp)
-            }
-          }
-        }
-      }
-    ) { paddingValues ->
-      Column(
-        modifier = Modifier
-          .fillMaxSize()
-          .background(Color(0xFF0F172A))
-          .padding(paddingValues)
-          .padding(horizontal = 24.dp)
-          .verticalScroll(rememberScrollState()),
-        horizontalAlignment = Alignment.CenterHorizontally
-      ) {
-        Spacer(modifier = Modifier.height(24.dp))
-        Text(
-          text = "✍️ Progress Check Complete!",
-          style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.Black),
-          color = Color.White,
-          textAlign = TextAlign.Center
-        )
-        Spacer(modifier = Modifier.height(6.dp))
-        Text(
-          text = "Let's review how your English skills are advancing.",
-          style = MaterialTheme.typography.bodyMedium,
-          color = Color.White.copy(alpha = 0.6f),
-          textAlign = TextAlign.Center
-        )
-
-        Spacer(modifier = Modifier.height(24.dp))
-
-        // Level card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp),
-          colors = CardDefaults.cardColors(
-            containerColor = Color(0xFF1E293B)
-          ),
-          shape = RoundedCornerShape(16.dp)
-        ) {
-          Column(
-            modifier = Modifier.padding(20.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-          ) {
-            Text(
-              text = "ESTIMATED PROFICIENCY LEVEL",
-              fontSize = 11.sp,
-              fontWeight = FontWeight.Bold,
-              color = Color(0xFFF59E0B),
-              letterSpacing = 1.sp
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-              text = activeReassessmentResult.estimatedLevel,
-              style = MaterialTheme.typography.displayMedium.copy(fontWeight = FontWeight.Black),
-              color = Color.White
-            )
-            Text(
-              text = activeReassessmentResult.estimatedLevelDescription,
-              style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
-              color = Color.White.copy(alpha = 0.9f)
-            )
-            Spacer(modifier = Modifier.height(12.dp))
-            Text(
-              text = "⚠️ Estimated progress check: This is a diagnostic progress approximation designed to guide your practice. It is not an official CEFR certification.",
-              fontSize = 10.sp,
-              color = Color.White.copy(alpha = 0.45f),
-              textAlign = TextAlign.Center,
-              lineHeight = 14.sp
-            )
-          }
-        }
-
-        Spacer(modifier = Modifier.height(20.dp))
-
-        // What improved card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp),
-          colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
-          shape = RoundedCornerShape(12.dp)
-        ) {
-          Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Text(text = "🚀", fontSize = 20.sp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = "WHAT IMPROVED",
-                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                color = Color(0xFF10B981)
-              )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-              text = activeReassessmentResult.whatImproved,
-              style = MaterialTheme.typography.bodyMedium,
-              color = Color.White.copy(alpha = 0.85f),
-              lineHeight = 18.sp
-            )
-          }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // What stayed weak card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp),
-          colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
-          shape = RoundedCornerShape(12.dp)
-        ) {
-          Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Text(text = "⚠️", fontSize = 20.sp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = "WHAT STAYED WEAK",
-                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                color = Color(0xFFEF4444)
-              )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-              text = activeReassessmentResult.whatStayedWeak,
-              style = MaterialTheme.typography.bodyMedium,
-              color = Color.White.copy(alpha = 0.85f),
-              lineHeight = 18.sp
-            )
-          }
-        }
-
-        Spacer(modifier = Modifier.height(12.dp))
-
-        // What to focus next week card
-        Card(
-          modifier = Modifier
-            .fillMaxWidth()
-            .widthIn(max = 500.dp),
-          colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
-          shape = RoundedCornerShape(12.dp)
-        ) {
-          Column(modifier = Modifier.padding(16.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-              Text(text = "💡", fontSize = 20.sp)
-              Spacer(modifier = Modifier.width(8.dp))
-              Text(
-                text = "FOCUS FOR NEXT WEEK",
-                style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.Bold),
-                color = Color(0xFF3B82F6)
-              )
-            }
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-              text = activeReassessmentResult.focusNextWeek,
-              style = MaterialTheme.typography.bodyMedium,
-              color = Color.White.copy(alpha = 0.85f),
-              lineHeight = 18.sp
-            )
-          }
-        }
-
-        Spacer(modifier = Modifier.height(40.dp))
-      }
-    }
-    return
-  }
-
-  // Questionnaire Flow
   Scaffold(
-    modifier = Modifier.fillMaxSize(),
     topBar = {
-      Row(
-        modifier = Modifier
-          .fillMaxWidth()
-          .background(Color(0xFF0F172A))
-          .padding(
-            top = WindowInsets.statusBars.asPaddingValues().calculateTopPadding() + 12.dp,
-            bottom = 12.dp,
-            start = 16.dp,
-            end = 16.dp
-          ),
-        verticalAlignment = Alignment.CenterVertically
-      ) {
-        IconButton(
-          onClick = {
-            if (step > 1) {
-              step -= 1
-            } else {
-              onBack()
-            }
+      TopAppBar(
+        title = { Text("Progress Review", fontWeight = FontWeight.Bold) },
+        navigationIcon = {
+          IconButton(onClick = onBack) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
           }
-        ) {
-          Icon(
-            imageVector = Icons.Default.ArrowBack,
-            contentDescription = "Back Step",
-            tint = Color(0xFFF59E0B)
-          )
-        }
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(
-          text = "Learning Progress Check",
-          style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
-          color = Color.White
-        )
-        Spacer(modifier = Modifier.weight(1f))
-        Text(
-          text = "Step $step of $maxSteps",
-          style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.Bold),
-          color = Color(0xFFF59E0B)
-        )
-      }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.background)
+      )
     },
-    bottomBar = {
-      Surface(
-        color = Color(0xFF0F172A),
-        modifier = Modifier
-          .fillMaxWidth()
-          .navigationBarsPadding()
-      ) {
-        Box(
-          modifier = Modifier
-            .fillMaxWidth()
-            .padding(horizontal = 24.dp, vertical = 16.dp),
-          contentAlignment = Alignment.Center
-        ) {
-          Button(
-            onClick = {
-              focusManager.clearFocus()
-              if (step < maxSteps) {
-                step += 1
-              } else {
-                onCompleteReassessment(
-                  WeeklyReassessmentAnswers(
-                    roleplayAnswer = roleplayAnswer,
-                    opinionAnswer = opinionAnswer,
-                    correctionAnswer = correctionAnswer,
-                    realLifeAnswer = realLifeAnswer
-                  )
-                )
-              }
-            },
-            modifier = Modifier
-              .fillMaxWidth()
-              .widthIn(max = 400.dp)
-              .height(52.dp)
-              .testTag("reassessment_next_button")
-              .shadow(4.dp, RoundedCornerShape(26.dp)),
-            colors = ButtonDefaults.buttonColors(
-              containerColor = Color(0xFFF59E0B),
-              contentColor = Color.Black
-            ),
-            shape = RoundedCornerShape(26.dp),
-            enabled = when (step) {
-              1 -> roleplayAnswer.isNotBlank()
-              2 -> opinionAnswer.isNotBlank()
-              3 -> correctionAnswer.isNotBlank()
-              4 -> realLifeAnswer.isNotBlank()
-              else -> false
-            }
-          ) {
-            Text(
-              text = if (step < maxSteps) "Next Step ➡️" else "Submit Reassessment 🎯",
-              fontWeight = FontWeight.ExtraBold,
-              fontSize = 16.sp
-            )
-          }
-        }
-      }
-    }
+    containerColor = MaterialTheme.colorScheme.background
   ) { paddingValues ->
     Column(
       modifier = Modifier
         .fillMaxSize()
-        .background(Color(0xFF0F172A))
         .padding(paddingValues)
-        .padding(horizontal = 24.dp)
-        .verticalScroll(rememberScrollState())
+        .padding(24.dp),
+      horizontalAlignment = Alignment.CenterHorizontally
     ) {
-      Spacer(modifier = Modifier.height(12.dp))
-
-      LinearProgressIndicator(
-        progress = progress,
+      Spacer(modifier = Modifier.height(32.dp))
+      
+      Box(
         modifier = Modifier
-          .fillMaxWidth()
-          .height(6.dp)
-          .clip(RoundedCornerShape(3.dp)),
-        color = Color(0xFFF59E0B),
-        trackColor = Color(0xFF1E293B)
+          .size(100.dp)
+          .clip(CircleShape)
+          .background(MaterialTheme.colorScheme.primaryContainer),
+        contentAlignment = Alignment.Center
+      ) {
+        Text("🌱", fontSize = 48.sp)
+      }
+      
+      Spacer(modifier = Modifier.height(32.dp))
+      
+      Text(
+        text = "You're Making Progress!",
+        style = MaterialTheme.typography.headlineMedium.copy(fontWeight = FontWeight.ExtraBold),
+        color = MaterialTheme.colorScheme.primary,
+        textAlign = TextAlign.Center
       )
-
-      Spacer(modifier = Modifier.height(24.dp))
-
-      when (step) {
-        1 -> {
-          Text(
-            text = "🎭 Task 1: Roleplay Task",
-            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-            color = Color.White
-          )
+      
+      Spacer(modifier = Modifier.height(16.dp))
+      
+      Text(
+        text = "You sounded clearer and more confident this week. Your practice is paying off.",
+        style = MaterialTheme.typography.bodyLarge,
+        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.8f),
+        textAlign = TextAlign.Center
+      )
+      
+      Spacer(modifier = Modifier.height(32.dp))
+      
+      Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
+        shape = RoundedCornerShape(16.dp)
+      ) {
+        Column(modifier = Modifier.padding(16.dp)) {
+          Text("Focus for next week:", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
           Spacer(modifier = Modifier.height(8.dp))
-          Text(
-            text = "Scenario: Sunday Roast order at a local pub",
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFFF59E0B)
-          )
-          Spacer(modifier = Modifier.height(12.dp))
-          Text(
-            text = "You are ordering lunch at a crowded, historic pub in ${onboardingData.city}. You want to get the traditional Sunday roast, ask the bar assistant politely for a local craft beer recommendation, and settle the payment using your contactless card.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.8f),
-            lineHeight = 20.sp
-          )
-          Spacer(modifier = Modifier.height(16.dp))
-          Text(
-            text = "Write your response as you would speak it:",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          OutlinedTextField(
-            value = roleplayAnswer,
-            onValueChange = { roleplayAnswer = it },
-            placeholder = { Text("E.g., Hi there! Could I order the Sunday roast, please? What local beers on tap do you recommend? Also, is it alright if I pay contactless?", color = Color.White.copy(alpha = 0.4f)) },
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(160.dp)
-              .testTag("reassessment_roleplay_input"),
-            colors = OutlinedTextFieldDefaults.colors(
-              focusedTextColor = Color.White,
-              unfocusedTextColor = Color.White,
-              focusedBorderColor = Color(0xFFF59E0B),
-              unfocusedBorderColor = Color.White.copy(alpha = 0.15f),
-              focusedLabelColor = Color(0xFFF59E0B),
-              unfocusedLabelColor = Color.White.copy(alpha = 0.6f)
-            ),
-            shape = RoundedCornerShape(12.dp)
-          )
-        }
-        2 -> {
-          Text(
-            text = "💬 Task 2: Opinion Formulation",
-            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          Text(
-            text = "Topic: Cashless Payments in Cities",
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFFF59E0B)
-          )
-          Spacer(modifier = Modifier.height(12.dp))
-          Text(
-            text = "Do you believe that cashless/contactless transactions are superior to using physical cash in modern cities like ${onboardingData.city}? Explain your perspective in detail. Try to use complex linkers (e.g., 'while', 'consequently', 'on the other hand').",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.8f),
-            lineHeight = 20.sp
-          )
-          Spacer(modifier = Modifier.height(16.dp))
-          Text(
-            text = "Write your opinion response:",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          OutlinedTextField(
-            value = opinionAnswer,
-            onValueChange = { opinionAnswer = it },
-            placeholder = { Text("E.g., While contactless is extremely quick and efficient in modern cities, cash remains important for accessibility, consequently I believe...", color = Color.White.copy(alpha = 0.4f)) },
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(160.dp)
-              .testTag("reassessment_opinion_input"),
-            colors = OutlinedTextFieldDefaults.colors(
-              focusedTextColor = Color.White,
-              unfocusedTextColor = Color.White,
-              focusedBorderColor = Color(0xFFF59E0B),
-              unfocusedBorderColor = Color.White.copy(alpha = 0.15f),
-              focusedLabelColor = Color(0xFFF59E0B),
-              unfocusedLabelColor = Color.White.copy(alpha = 0.6f)
-            ),
-            shape = RoundedCornerShape(12.dp)
-          )
-        }
-        3 -> {
-          Text(
-            text = "✏️ Task 3: Politeness & Style Correction",
-            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          Text(
-            text = "Original sentence: 'I want that you tell me the way to subway station.'",
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFFF59E0B)
-          )
-          Spacer(modifier = Modifier.height(12.dp))
-          Text(
-            text = "The original sentence is grammatically correct but sounds very literal, direct, and slightly impolite to native ears in ${onboardingData.city}. Rewrite this sentence to sound polite, natural, and idiomatic for a local passerby.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.8f),
-            lineHeight = 20.sp
-          )
-          Spacer(modifier = Modifier.height(16.dp))
-          Text(
-            text = "Write your corrected polite sentence:",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          OutlinedTextField(
-            value = correctionAnswer,
-            onValueChange = { correctionAnswer = it },
-            placeholder = { Text("E.g., Excuse me, sorry to bother you, could you please point me towards the nearest tube station?", color = Color.White.copy(alpha = 0.4f)) },
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(120.dp)
-              .testTag("reassessment_correction_input"),
-            colors = OutlinedTextFieldDefaults.colors(
-              focusedTextColor = Color.White,
-              unfocusedTextColor = Color.White,
-              focusedBorderColor = Color(0xFFF59E0B),
-              unfocusedBorderColor = Color.White.copy(alpha = 0.15f),
-              focusedLabelColor = Color(0xFFF59E0B),
-              unfocusedLabelColor = Color.White.copy(alpha = 0.6f)
-            ),
-            shape = RoundedCornerShape(12.dp)
-          )
-        }
-        4 -> {
-          Text(
-            text = "🚇 Task 4: Real-Life Safety Situation",
-            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.ExtraBold),
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          Text(
-            text = "Scenario: Warning of train platform gap",
-            fontSize = 12.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color(0xFFF59E0B)
-          )
-          Spacer(modifier = Modifier.height(12.dp))
-          Text(
-            text = "You are walking with your friend boarding an Underground train at a TfL station. You notice a huge, dangerous gap between the carriage and the platform. How do you warn your friend quickly and naturally in native transit English?",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.8f),
-            lineHeight = 20.sp
-          )
-          Spacer(modifier = Modifier.height(16.dp))
-          Text(
-            text = "Write your warning statement:",
-            fontSize = 13.sp,
-            fontWeight = FontWeight.Bold,
-            color = Color.White
-          )
-          Spacer(modifier = Modifier.height(8.dp))
-          OutlinedTextField(
-            value = realLifeAnswer,
-            onValueChange = { realLifeAnswer = it },
-            placeholder = { Text("E.g., Mind the gap, mate! Watch your step as you get on the train.", color = Color.White.copy(alpha = 0.4f)) },
-            modifier = Modifier
-              .fillMaxWidth()
-              .height(120.dp)
-              .testTag("reassessment_real_life_input"),
-            colors = OutlinedTextFieldDefaults.colors(
-              focusedTextColor = Color.White,
-              unfocusedTextColor = Color.White,
-              focusedBorderColor = Color(0xFFF59E0B),
-              unfocusedBorderColor = Color.White.copy(alpha = 0.15f),
-              focusedLabelColor = Color(0xFFF59E0B),
-              unfocusedLabelColor = Color.White.copy(alpha = 0.6f)
-            ),
-            shape = RoundedCornerShape(12.dp)
-          )
+          Text("Let's practise building smoother sentences and using more natural expressions.", color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
       }
-
-      Spacer(modifier = Modifier.height(24.dp))
-      Text(
-        text = "🔒 Estimated progress check: Results do not constitute an official CEFR certification and are computed purely as a study progress approximation.",
-        fontSize = 10.sp,
-        color = Color.White.copy(alpha = 0.35f),
-        lineHeight = 14.sp
-      )
-      Spacer(modifier = Modifier.height(40.dp))
+      
+      Spacer(modifier = Modifier.weight(1f))
+      
+      Button(
+        onClick = onBack,
+        modifier = Modifier
+          .fillMaxWidth()
+          .height(56.dp),
+        shape = RoundedCornerShape(16.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
+      ) {
+        Text("Continue Learning", fontSize = 16.sp, fontWeight = FontWeight.Bold)
+      }
     }
   }
 }
@@ -12471,7 +9549,7 @@ fun FluentCityLessonValidationScreen(
             Icon(
               imageVector = Icons.Default.CheckCircle,
               contentDescription = null,
-              tint = Color(0xFF14B8A6),
+              tint = MaterialTheme.colorScheme.primary,
               modifier = Modifier.size(24.dp)
             )
             Spacer(modifier = Modifier.width(8.dp))
@@ -12479,30 +9557,31 @@ fun FluentCityLessonValidationScreen(
               text = "Linguistic Audit Control",
               fontSize = 18.sp,
               fontWeight = FontWeight.Bold,
-              color = Color.White
+              color = MaterialTheme.colorScheme.onSurface
             )
           }
         },
         navigationIcon = {
           IconButton(onClick = onBack) {
             Icon(
-              imageVector = Icons.Default.ArrowBack,
+              imageVector = Icons.AutoMirrored.Filled.ArrowBack,
               contentDescription = "Back",
-              tint = Color.White
+              tint = MaterialTheme.colorScheme.onSurface
             )
           }
         },
         colors = TopAppBarDefaults.topAppBarColors(
-          containerColor = Color(0xFF0F172A)
+          containerColor = MaterialTheme.colorScheme.background
         )
       )
     },
-    containerColor = Color(0xFF0F172A)
+    containerColor = MaterialTheme.colorScheme.background
   ) { paddingValues ->
     Box(
       modifier = Modifier
         .fillMaxSize()
         .padding(paddingValues)
+        .navigationBarsPadding()
     ) {
       if (isScanning) {
         Column(
@@ -12513,7 +9592,7 @@ fun FluentCityLessonValidationScreen(
           horizontalAlignment = Alignment.CenterHorizontally
         ) {
           CircularProgressIndicator(
-            color = Color(0xFF14B8A6),
+            color = MaterialTheme.colorScheme.primary,
             strokeWidth = 4.dp,
             modifier = Modifier.size(60.dp)
           )
@@ -12522,13 +9601,13 @@ fun FluentCityLessonValidationScreen(
             text = "Fluent City Linguistic Auditor",
             fontSize = 18.sp,
             fontWeight = FontWeight.Bold,
-            color = Color.White
+            color = MaterialTheme.colorScheme.onSurface
           )
           Spacer(modifier = Modifier.height(8.dp))
           Text(
             text = "Analyzing curriculum metrics against 8 quality control gates...",
             fontSize = 13.sp,
-            color = Color.White.copy(alpha = 0.6f),
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
             textAlign = TextAlign.Center
           )
           
@@ -12538,24 +9617,24 @@ fun FluentCityLessonValidationScreen(
           Column(
             modifier = Modifier
               .fillMaxWidth(0.85f)
-              .background(Color(0xFF1E293B), RoundedCornerShape(12.dp))
+              .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(12.dp))
               .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp)
           ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-              Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF14B8A6), modifier = Modifier.size(16.dp))
+              Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
               Spacer(modifier = Modifier.width(8.dp))
-              Text("Calibrating CEFR Level complexity...", fontSize = 11.sp, color = Color.White.copy(alpha = 0.8f))
+              Text("Calibrating CEFR Level complexity...", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
-              Icon(Icons.Default.CheckCircle, null, tint = Color(0xFF14B8A6), modifier = Modifier.size(16.dp))
+              Icon(Icons.Default.CheckCircle, null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(16.dp))
               Spacer(modifier = Modifier.width(8.dp))
-              Text("Verifying '${onboardingData.city}' local transport syntax...", fontSize = 11.sp, color = Color.White.copy(alpha = 0.8f))
+              Text("Verifying '${onboardingData.city}' local transport syntax...", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
-              CircularProgressIndicator(color = Color(0xFFF59E0B), strokeWidth = 1.5.dp, modifier = Modifier.size(12.dp))
+              CircularProgressIndicator(color = MaterialTheme.colorScheme.secondary, strokeWidth = 1.5.dp, modifier = Modifier.size(12.dp))
               Spacer(modifier = Modifier.width(12.dp))
-              Text("Recycling historical mistake records...", fontSize = 11.sp, color = Color.White.copy(alpha = 0.5f))
+              Text("Recycling historical mistake records...", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
           }
         }
@@ -12571,8 +9650,8 @@ fun FluentCityLessonValidationScreen(
               .fillMaxWidth()
               .padding(vertical = 8.dp),
             shape = RoundedCornerShape(16.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
-            border = BorderStroke(1.dp, Color(0xFF334155))
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
           ) {
             Column(modifier = Modifier.padding(16.dp)) {
               Row(
@@ -12584,9 +9663,9 @@ fun FluentCityLessonValidationScreen(
                   text = "Lesson Day ${task.day}",
                   fontSize = 12.sp,
                   fontWeight = FontWeight.Bold,
-                  color = Color(0xFF14B8A6),
+                  color = MaterialTheme.colorScheme.primary,
                   modifier = Modifier
-                    .background(Color(0xFF14B8A6).copy(alpha = 0.15f), RoundedCornerShape(6.dp))
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f), RoundedCornerShape(6.dp))
                     .padding(horizontal = 8.dp, vertical = 4.dp)
                 )
                 Text(
@@ -12599,13 +9678,13 @@ fun FluentCityLessonValidationScreen(
                 text = task.title,
                 fontSize = 18.sp,
                 fontWeight = FontWeight.Bold,
-                color = Color.White
+                color = MaterialTheme.colorScheme.onSurface
               )
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = task.situation,
                 fontSize = 13.sp,
-                color = Color.White.copy(alpha = 0.7f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 lineHeight = 18.sp
               )
             }
@@ -12622,28 +9701,28 @@ fun FluentCityLessonValidationScreen(
               Box(
                 modifier = Modifier
                   .size(10.dp)
-                  .background(Color(0xFF14B8A6), CircleShape)
+                  .background(MaterialTheme.colorScheme.primary, CircleShape)
               )
               Spacer(modifier = Modifier.width(6.dp))
-              Text("Passed: ${8 - failedCheckCount - warningCheckCount}", fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
+              Text("Passed: ${8 - failedCheckCount - warningCheckCount}", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
               Box(
                 modifier = Modifier
                   .size(10.dp)
-                  .background(Color(0xFFF59E0B), CircleShape)
+                  .background(MaterialTheme.colorScheme.secondary, CircleShape)
               )
               Spacer(modifier = Modifier.width(6.dp))
-              Text("Warnings: $warningCheckCount", fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
+              Text("Warnings: $warningCheckCount", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
               Box(
                 modifier = Modifier
                   .size(10.dp)
-                  .background(Color(0xFFEF4444), CircleShape)
+                  .background(MaterialTheme.colorScheme.error, CircleShape)
               )
               Spacer(modifier = Modifier.width(6.dp))
-              Text("Deficiencies: $failedCheckCount", fontSize = 11.sp, color = Color.White.copy(alpha = 0.6f))
+              Text("Deficiencies: $failedCheckCount", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
           }
 
@@ -12652,13 +9731,13 @@ fun FluentCityLessonValidationScreen(
               modifier = Modifier
                 .fillMaxWidth()
                 .padding(vertical = 4.dp),
-              colors = CardDefaults.cardColors(containerColor = Color(0xFFEF4444).copy(alpha = 0.15f)),
-              border = BorderStroke(1.dp, Color(0xFFEF4444))
+              colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.15f)),
+              border = BorderStroke(1.dp, MaterialTheme.colorScheme.error)
             ) {
               Text(
                 text = errorText ?: "",
                 fontSize = 12.sp,
-                color = Color(0xFFFECACA),
+                color = MaterialTheme.colorScheme.errorContainer,
                 modifier = Modifier.padding(12.dp)
               )
             }
@@ -12678,17 +9757,17 @@ fun FluentCityLessonValidationScreen(
                 shape = RoundedCornerShape(12.dp),
                 colors = CardDefaults.cardColors(
                   containerColor = when (chk.status) {
-                    CheckStatus.PASSED -> Color(0xFF0F172A)
-                    CheckStatus.WARNING -> Color(0xFF1E293B)
-                    CheckStatus.FAILED -> Color(0xFF1E293B)
+                    CheckStatus.PASSED -> MaterialTheme.colorScheme.background
+                    CheckStatus.WARNING -> MaterialTheme.colorScheme.surface
+                    CheckStatus.FAILED -> MaterialTheme.colorScheme.surface
                   }
                 ),
                 border = BorderStroke(
                   width = 1.dp,
                   color = when (chk.status) {
-                    CheckStatus.PASSED -> Color(0xFF14B8A6).copy(alpha = 0.3f)
-                    CheckStatus.WARNING -> Color(0xFFF59E0B).copy(alpha = 0.4f)
-                    CheckStatus.FAILED -> Color(0xFFEF4444).copy(alpha = 0.4f)
+                    CheckStatus.PASSED -> MaterialTheme.colorScheme.primary.copy(alpha = 0.3f)
+                    CheckStatus.WARNING -> MaterialTheme.colorScheme.secondary.copy(alpha = 0.4f)
+                    CheckStatus.FAILED -> MaterialTheme.colorScheme.error.copy(alpha = 0.4f)
                   }
                 )
               ) {
@@ -12706,9 +9785,9 @@ fun FluentCityLessonValidationScreen(
                     },
                     contentDescription = null,
                     tint = when (chk.status) {
-                      CheckStatus.PASSED -> Color(0xFF14B8A6)
-                      CheckStatus.WARNING -> Color(0xFFF59E0B)
-                      CheckStatus.FAILED -> Color(0xFFEF4444)
+                      CheckStatus.PASSED -> MaterialTheme.colorScheme.primary
+                      CheckStatus.WARNING -> MaterialTheme.colorScheme.secondary
+                      CheckStatus.FAILED -> MaterialTheme.colorScheme.error
                     },
                     modifier = Modifier
                       .size(20.dp)
@@ -12720,18 +9799,18 @@ fun FluentCityLessonValidationScreen(
                       text = "${chk.number}. ${chk.title}",
                       fontSize = 14.sp,
                       fontWeight = FontWeight.Bold,
-                      color = Color.White
+                      color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
                       text = chk.description,
                       fontSize = 11.sp,
-                      color = Color.White.copy(alpha = 0.5f)
+                      color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
                       text = chk.feedback,
                       fontSize = 12.sp,
-                      color = Color.White.copy(alpha = 0.8f),
+                      color = MaterialTheme.colorScheme.onSurface,
                       lineHeight = 16.sp
                     )
                   }
@@ -12754,8 +9833,8 @@ fun FluentCityLessonValidationScreen(
                 .height(48.dp)
                 .testTag("regenerate_lesson_button"),
               shape = RoundedCornerShape(12.dp),
-              border = BorderStroke(1.5.dp, Color(0xFFF59E0B)),
-              colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFF59E0B))
+              border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.secondary),
+              colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.secondary)
             ) {
               Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -12779,8 +9858,7 @@ fun FluentCityLessonValidationScreen(
                 .testTag("start_audited_lesson_button"),
               shape = RoundedCornerShape(12.dp),
               colors = ButtonDefaults.buttonColors(
-                containerColor = if (failedCheckCount > 0) Color(0xFF475569) else Color(0xFF14B8A6),
-                contentColor = Color.White
+                containerColor = if (failedCheckCount > 0) MaterialTheme.colorScheme.outlineVariant else MaterialTheme.colorScheme.primary, contentColor = if (failedCheckCount > 0) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onPrimary
               )
             ) {
               Row(
@@ -12802,34 +9880,34 @@ fun FluentCityLessonValidationScreen(
         Box(
           modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.75f)),
+            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.5f)),
           contentAlignment = Alignment.Center
         ) {
           Card(
             modifier = Modifier
               .fillMaxWidth(0.8f)
               .padding(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E293B)),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
             shape = RoundedCornerShape(16.dp),
-            border = BorderStroke(1.dp, Color(0xFF334155))
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
           ) {
             Column(
               modifier = Modifier.padding(24.dp),
               horizontalAlignment = Alignment.CenterHorizontally
             ) {
-              CircularProgressIndicator(color = Color(0xFFF59E0B), modifier = Modifier.size(45.dp))
+              CircularProgressIndicator(color = MaterialTheme.colorScheme.secondary, modifier = Modifier.size(45.dp))
               Spacer(modifier = Modifier.height(16.dp))
               Text(
                 text = "Regenerating Lesson...",
                 fontWeight = FontWeight.Bold,
                 fontSize = 16.sp,
-                color = Color.White
+                color = MaterialTheme.colorScheme.onSurface
               )
               Spacer(modifier = Modifier.height(8.dp))
               Text(
                 text = "Gemini is re-weaving grammar, regional slang, goals, and corrections into your custom session.",
                 fontSize = 12.sp,
-                color = Color.White.copy(alpha = 0.6f),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center,
                 lineHeight = 16.sp
               )
@@ -12841,4 +9919,325 @@ fun FluentCityLessonValidationScreen(
   }
 }
 
+
+
+
+
+enum class VoiceMissionStep {
+  ROLEPLAY,
+  FEEDBACK
+}
+
+@OptIn(ExperimentalLayoutApi::class, ExperimentalMaterial3Api::class)
+@Composable
+fun FluentCityVoicePracticeScreen(
+  task: DayTask,
+  cityName: String,
+  learningProfile: LearningProfile?,
+  practiceMode: String = "Coach me gently",
+  recordedMistakes: List<RecordedMistake> = emptyList(),
+  onBack: () -> Unit,
+  onCompleted: (Int, SessionFeedback?, List<Pair<String, String>>, String) -> Unit,
+  onMistakeRecorded: (String, String, String) -> Unit = { _, _, _ -> },
+  confidenceRatings: Map<Int, String> = emptyMap(),
+  sessionPerformanceScores: Map<Int, Int> = emptyMap()
+) {
+  val context = LocalContext.current
+  val coroutineScope = rememberCoroutineScope()
+  val character = remember(task) { getCharacterForTask(task) }
+  
+  var hasPermission by remember { mutableStateOf(false) }
+  val permissionLauncher = rememberLauncherForActivityResult(
+    ActivityResultContracts.RequestPermission()
+  ) { isGranted ->
+    hasPermission = isGranted
+  }
+
+  LaunchedEffect(Unit) {
+    permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+  }
+
+  var tts by remember { mutableStateOf<TextToSpeech?>(null) }
+  DisposableEffect(context) {
+    var initializedTts: TextToSpeech? = null
+    initializedTts = TextToSpeech(context) { status ->
+      if (status == TextToSpeech.SUCCESS) {
+        initializedTts?.language = Locale.UK
+        tts = initializedTts
+      }
+    }
+    onDispose {
+      initializedTts?.stop()
+      initializedTts?.shutdown()
+    }
+  }
+
+  val speechRecognizer = remember { SpeechRecognizer.createSpeechRecognizer(context) }
+  var isListening by remember { mutableStateOf(false) }
+  var spokenText by remember { mutableStateOf("") }
+
+  DisposableEffect(speechRecognizer) {
+    val listener = object : RecognitionListener {
+      override fun onReadyForSpeech(params: Bundle?) {}
+      override fun onBeginningOfSpeech() {}
+      override fun onRmsChanged(rmsdB: Float) {}
+      override fun onBufferReceived(buffer: ByteArray?) {}
+      override fun onEndOfSpeech() { isListening = false }
+      override fun onError(error: Int) { isListening = false }
+      override fun onResults(results: Bundle?) {
+        val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+        if (!matches.isNullOrEmpty()) {
+          spokenText = matches[0]
+        }
+        isListening = false
+      }
+      override fun onPartialResults(partialResults: Bundle?) {
+        val matches = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+        if (!matches.isNullOrEmpty()) {
+          spokenText = matches[0]
+        }
+      }
+      override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+    speechRecognizer.setRecognitionListener(listener)
+    onDispose { speechRecognizer.destroy() }
+  }
+
+  var currentStep by remember { mutableStateOf(VoiceMissionStep.ROLEPLAY) }
+  var messages by remember { mutableStateOf(listOf<ChatMessage>()) }
+  var isAiThinking by remember { mutableStateOf(false) }
+  var turns by remember { mutableStateOf(0) }
+  var feedbackData by remember { mutableStateOf<SessionFeedback?>(null) }
+  var isFinished by remember { mutableStateOf(false) }
+  var latestUserMessage by remember { mutableStateOf("") }
+
+  // Initial greeting for roleplay
+  LaunchedEffect(currentStep) {
+    if (currentStep == VoiceMissionStep.ROLEPLAY && messages.isEmpty()) {
+      delay(500)
+      val greeting = ChatMessage(
+        id = "ai_" + System.currentTimeMillis(),
+        text = task.systemResponse,
+        isUser = false,
+        senderName = character.name
+      )
+      messages = messages + greeting
+      tts?.speak(greeting.text, TextToSpeech.QUEUE_FLUSH, null, null)
+    }
+  }
+
+  val sendUserMessage = { text: String ->
+    if (text.isNotBlank()) {
+      if (currentStep == VoiceMissionStep.ROLEPLAY && !isFinished) {
+        latestUserMessage = text
+        val userMsg = ChatMessage(
+          id = "user_" + System.currentTimeMillis(),
+          text = text,
+          isUser = true,
+          senderName = "You"
+        )
+        messages = messages + userMsg
+        spokenText = ""
+        turns++
+        isAiThinking = true
+        
+        coroutineScope.launch {
+          try {
+            if (turns >= 3) {
+              // Get feedback and end
+              feedbackData = GeminiAnalyzer.getPracticeSessionFeedback(task, cityName, messages, learningProfile)
+              isFinished = true
+              isAiThinking = false
+              currentStep = VoiceMissionStep.FEEDBACK
+            } else {
+              val liveResp = GeminiAnalyzer.getLiveChatResponse(
+                task, cityName, character.name, character.role, messages, text, learningProfile, "", practiceMode
+              )
+              val aiMsg = ChatMessage(
+                id = "ai_" + System.currentTimeMillis(),
+                text = liveResp.reply,
+                isUser = false,
+                senderName = character.name
+              )
+              messages = messages + aiMsg
+              tts?.speak(liveResp.reply, TextToSpeech.QUEUE_FLUSH, null, null)
+              isAiThinking = false
+            }
+          } catch (e: Exception) {
+            isAiThinking = false
+          }
+        }
+      }
+    }
+  }
+
+  Scaffold(
+    topBar = {
+      TopAppBar(
+        title = { Text(task.title, fontWeight = FontWeight.Bold) },
+        navigationIcon = {
+          IconButton(onClick = onBack) {
+            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+          }
+        },
+        colors = TopAppBarDefaults.topAppBarColors(containerColor = MaterialTheme.colorScheme.surface)
+      )
+    },
+    containerColor = MaterialTheme.colorScheme.background
+  ) { paddingValues ->
+    Column(
+      modifier = Modifier
+        .fillMaxSize()
+        .padding(paddingValues)
+        .padding(16.dp),
+      horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+      if (currentStep == VoiceMissionStep.FEEDBACK) {
+        Text("Mission Complete! 🎉", style = MaterialTheme.typography.titleLarge, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.ExtraBold)
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Card(modifier = Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+          Column(modifier = Modifier.padding(24.dp)) {
+            Text("Short Feedback", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.secondary)
+            Spacer(modifier = Modifier.height(16.dp))
+            
+            Text("What you said:", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error)
+            Text(feedbackData?.improvement?.userOriginal ?: latestUserMessage, fontStyle = FontStyle.Italic)
+            
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("Better way to say it:", fontWeight = FontWeight.Bold, color = Color(0xFF00796B))
+            Text(feedbackData?.improvement?.natural ?: feedbackData?.grammar?.naturalVersion ?: "Great as is!")
+            
+            Spacer(modifier = Modifier.height(32.dp))
+            Button(
+              onClick = { 
+                onCompleted(task.day, feedbackData, emptyList(), "Confident") 
+              },
+              modifier = Modifier.fillMaxWidth().height(50.dp),
+              shape = RoundedCornerShape(12.dp)
+            ) {
+              Text("Finish & Save Progress", fontWeight = FontWeight.Bold)
+            }
+          }
+        }
+      }
+      else {
+        // Chat UI for ROLEPLAY
+        Text("Step 1: Roleplay", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+        Spacer(modifier = Modifier.height(8.dp))
+        LazyColumn(
+          modifier = Modifier.weight(1f).fillMaxWidth(),
+          reverseLayout = true
+        ) {
+          items(messages.reversed()) { msg ->
+            val isUser = msg.isUser
+            Row(
+              modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+              horizontalArrangement = if (isUser) Arrangement.End else Arrangement.Start
+            ) {
+              Box(
+                modifier = Modifier
+                  .widthIn(max = 280.dp)
+                  .clip(RoundedCornerShape(16.dp))
+                  .background(if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant)
+                  .padding(12.dp)
+              ) {
+                Column {
+                  Text(msg.text, color = if (isUser) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant)
+                  if (!isUser) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row {
+                      IconButton(
+                        onClick = { tts?.speak(msg.text, TextToSpeech.QUEUE_FLUSH, null, null) },
+                        modifier = Modifier.size(24.dp)
+                      ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = "Replay")
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          if (isAiThinking) {
+            item {
+              CircularProgressIndicator(modifier = Modifier.padding(16.dp))
+            }
+          }
+        }
+      }
+
+      // Bottom input area for steps that require speaking
+      if (currentStep == VoiceMissionStep.ROLEPLAY) {
+        Spacer(modifier = Modifier.height(16.dp))
+
+        if (isListening) {
+          Text("Listening...", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.Bold)
+        }
+        if (spokenText.isNotEmpty()) {
+          Text("Transcript: $spokenText", fontStyle = FontStyle.Italic)
+        }
+        
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Row(
+          modifier = Modifier.fillMaxWidth(),
+          horizontalArrangement = Arrangement.SpaceEvenly,
+          verticalAlignment = Alignment.CenterVertically
+        ) {
+          Button(
+            onClick = {
+              if (isListening) {
+                speechRecognizer.stopListening()
+                isListening = false
+                if (spokenText.isNotBlank()) {
+                  sendUserMessage(spokenText)
+                }
+              } else {
+                if (hasPermission) {
+                  spokenText = ""
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.UK)
+                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                  }
+                  speechRecognizer.startListening(intent)
+                  isListening = true
+                } else {
+                  permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                }
+              }
+            },
+            colors = ButtonDefaults.buttonColors(
+              containerColor = if (isListening) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+            ),
+            modifier = Modifier.height(56.dp)
+          ) {
+            Icon(Icons.Default.PlayArrow, contentDescription = "Speak")
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(if (isListening) "Stop" else "Hold to Speak")
+          }
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        var typedText by remember { mutableStateOf("") }
+        OutlinedTextField(
+          value = typedText,
+          onValueChange = { typedText = it },
+          label = { Text("Typing fallback") },
+          modifier = Modifier.fillMaxWidth(),
+          trailingIcon = {
+            IconButton(onClick = { 
+              sendUserMessage(typedText)
+              typedText = ""
+            }) {
+              Icon(Icons.AutoMirrored.Filled.ArrowForward, contentDescription = "Send")
+            }
+          }
+        )
+      }
+    }
+  }
+}
 

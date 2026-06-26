@@ -1,0 +1,300 @@
+fun FluentCityCheckResultPage(
+  onboardingData: UserOnboardingData,
+  calibrationResult: CalibrationAnalysisResult?,
+  isCalibrating: Boolean,
+  calibrationError: String?,
+  onRetry: () -> Unit,
+  onContinue: () -> Unit,
+  onBack: () -> Unit
+) {
+  val scrollState = rememberScrollState()
+
+  if (isCalibrating) {
+    Scaffold(
+      modifier = Modifier.fillMaxSize()
+    ) { paddingValues ->
+      Box(
+        modifier = Modifier
+          .fillMaxSize()
+          .background(MaterialTheme.colorScheme.background)
+          .padding(paddingValues)
+          .padding(24.dp),
+        contentAlignment = Alignment.Center
+      ) {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.Center,
+          modifier = Modifier.fillMaxWidth().widthIn(max = 450.dp)
+        ) {
+          CircularProgressIndicator(
+            color = MaterialTheme.colorScheme.primary,
+            strokeWidth = 4.dp,
+            modifier = Modifier.size(64.dp)
+          )
+          
+          Spacer(modifier = Modifier.height(24.dp))
+          
+          Text(
+            text = "Building your personalized plan",
+            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+            color = MaterialTheme.colorScheme.onBackground,
+            textAlign = TextAlign.Center
+          )
+          
+          Spacer(modifier = Modifier.height(12.dp))
+          
+          Text(
+            text = "We are customizing your 7-day plan for ${onboardingData.city}. This will only take a moment!",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
+            textAlign = TextAlign.Center
+          )
+        }
+      }
+    }
+    return
+  }
+
+  if (calibrationError != null) {
+    Scaffold(
+      modifier = Modifier.fillMaxSize()
+    ) { paddingValues ->
+      Box(
+        modifier = Modifier
+          .fillMaxSize()
+          .background(MaterialTheme.colorScheme.background)
+          .padding(paddingValues)
+          .padding(24.dp),
+        contentAlignment = Alignment.Center
+      ) {
+        Column(
+          horizontalAlignment = Alignment.CenterHorizontally,
+          verticalArrangement = Arrangement.Center,
+          modifier = Modifier.fillMaxWidth().widthIn(max = 450.dp)
+        ) {
+          Text("⚠️", fontSize = 48.sp)
+          
+          Spacer(modifier = Modifier.height(16.dp))
+          
+          Text(
+            text = "Calibration Failed",
+            style = MaterialTheme.typography.titleLarge.copy(fontWeight = FontWeight.Bold),
+            color = MaterialTheme.colorScheme.error,
+            textAlign = TextAlign.Center
+          )
+          
+          Spacer(modifier = Modifier.height(12.dp))
+          
+          val errorMessage = if (calibrationError.contains("503") || calibrationError.contains("Service Unavailable")) {
+            "The Gemini API service is temporarily overloaded or unavailable. Please wait a moment and try again.\n\nDetails: $calibrationError"
+          } else if (calibrationError.contains("401") || calibrationError.contains("API key not valid") || calibrationError.contains("403")) {
+            "Please ensure you have entered a valid Gemini API Key in the AI Studio Secrets panel.\n\nDetails: $calibrationError"
+          } else {
+            "Ensure you have entered your Gemini API Key correctly in the AI Studio Secrets panel.\n\nDetails: $calibrationError"
+          }
+          
+          Text(
+            text = errorMessage,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
+            textAlign = TextAlign.Center
+          )
+          
+          Spacer(modifier = Modifier.height(24.dp))
+          
+          Button(
+            onClick = onRetry,
+            colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary),
+            modifier = Modifier.testTag("calibration_retry_button")
+          ) {
+            Text("Retry Calibration")
+          }
+          
+          Spacer(modifier = Modifier.height(12.dp))
+          
+          TextButton(onClick = onContinue) {
+            Text("Skip Calibration (Use Local Simulator)")
+          }
+        }
+      }
+    }
+    return
+  }
+
+  val displayLevel = calibrationResult?.estimatedLevel ?: "B1"
+  val displayDesc = calibrationResult?.estimatedLevelDescription ?: "Intermediate English speaker"
+  val structureFeedbackStr = calibrationResult?.structureCohesionFeedback 
+    ?: "Structure & Cohesion: Stable sentence structures and logic. You describe yourself well and state reasons clearly."
+  val scenariosFeedbackStr = calibrationResult?.practicalScenariosFeedback 
+    ?: "Practical Scenarios: Good attempt to call your landlord, which represents real-world readiness in ${onboardingData.city}. We can help polish local colloquialisms."
+  val milestoneFeedbackStr = calibrationResult?.nextMilestoneFeedback 
+    ?: "Next Milestone: We will inject specialized conversational training to help you break through to B2 (Upper Intermediate)."
+
+  Scaffold(
+    modifier = Modifier.fillMaxSize()
+  ) { paddingValues ->
+    Box(
+      modifier = Modifier
+        .fillMaxSize()
+        .background(MaterialTheme.colorScheme.background)
+        .padding(top = paddingValues.calculateTopPadding(), start = 20.dp, end = 20.dp)
+    ) {
+      Column(
+        modifier = Modifier
+          .fillMaxSize()
+          .verticalScroll(scrollState)
+          .navigationBarsPadding(),
+        horizontalAlignment = Alignment.CenterHorizontally
+      ) {
+        Spacer(modifier = Modifier.height(28.dp))
+
+        // Large Celebration Icon
+        Box(
+          modifier = Modifier
+            .size(80.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.tertiary.copy(alpha = 0.15f)),
+          contentAlignment = Alignment.Center
+        ) {
+          Text("🏆", fontSize = 38.sp)
+        }
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        Text(
+          text = "Your plan is ready.",
+          style = MaterialTheme.typography.displaySmall.copy(fontWeight = FontWeight.ExtraBold),
+          textAlign = TextAlign.Center,
+          color = MaterialTheme.colorScheme.onBackground
+        )
+
+        Spacer(modifier = Modifier.height(8.dp))
+
+        Text(
+          text = "We designed a custom 7-day study plan just for you.",
+          style = MaterialTheme.typography.bodyMedium,
+          color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
+          textAlign = TextAlign.Center,
+          modifier = Modifier.padding(horizontal = 8.dp)
+        )
+
+        Spacer(modifier = Modifier.height(28.dp))
+
+        // Level Display Card
+        Card(
+          modifier = Modifier
+            .fillMaxWidth()
+            .widthIn(max = 500.dp)
+            .border(
+              width = 1.dp,
+              color = MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+              shape = RoundedCornerShape(20.dp)
+            ),
+          colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surface
+          ),
+          shape = RoundedCornerShape(20.dp)
+        ) {
+          Column(
+            modifier = Modifier.padding(20.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+          ) {
+            Text(
+              text = "Estimated Level",
+              fontSize = 12.sp,
+              fontWeight = FontWeight.Bold,
+              color = MaterialTheme.colorScheme.secondary,
+              letterSpacing = 1.sp
+            )
+            
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Big Calibrated Circle
+            Box(
+              modifier = Modifier
+                .size(96.dp)
+                .clip(CircleShape)
+                .background(
+                  Brush.radialGradient(
+                    colors = listOf(
+                      MaterialTheme.colorScheme.primary.copy(alpha = 0.2f),
+                      MaterialTheme.colorScheme.primary.copy(alpha = 0.05f)
+                    )
+                  )
+                )
+                .border(2.dp, MaterialTheme.colorScheme.primary, CircleShape),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = displayLevel,
+                fontSize = 36.sp,
+                fontWeight = FontWeight.Black,
+                color = MaterialTheme.colorScheme.primary
+              )
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            Text(
+              text = displayDesc,
+              style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+              color = MaterialTheme.colorScheme.onSurface,
+              textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(16.dp))
+            DividerHorizontal(color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f))
+            Spacer(modifier = Modifier.height(16.dp))
+
+            // Three Main Metrics Request
+            Row(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+              // Metric 1: Recommended practice
+              Column(
+                modifier = Modifier
+                  .weight(1f)
+                  .clip(RoundedCornerShape(12.dp))
+                  .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.03f))
+                  .padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                Text(
+                  text = "⏳ PRACTICE",
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = MaterialTheme.colorScheme.secondary
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                  text = "${onboardingData.practiceMinutes} min/day",
+                  fontSize = 13.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = MaterialTheme.colorScheme.onSurface
+                )
+              }
+
+              // Metric 2: Primary Focus
+              Column(
+                modifier = Modifier
+                  .weight(1f)
+                  .clip(RoundedCornerShape(12.dp))
+                  .background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.03f))
+                  .padding(12.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                Text(
+                  text = "🎯 MAIN FOCUS",
+                  fontSize = 10.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = MaterialTheme.colorScheme.secondary
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                Text(
+                  text = onboardingData.mainGoal,
+                  fontSize = 13.sp,
+                  fontWeight = FontWeight.Bold,
+                  color = MaterialTheme.colorScheme.onSurface,
+                  maxLines = 1,
+                  overflow = TextOverflow.Ellipsis
